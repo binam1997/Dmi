@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 import pandas as pd
 
@@ -7,7 +8,7 @@ TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SYMBOL = "XAU/USD"
+SYMBOLS = ["CAD/JPY", "EUR/NZD", "XAU/USD", "GBP/USD", "USD/CAD"]
 INTERVAL = "5min"
 OUTPUT_SIZE = 300
 STATE_FILE = "state.json"
@@ -15,10 +16,10 @@ STATE_FILE = "state.json"
 DI_LENGTHS = [100]
 
 
-def fetch_candles():
+def fetch_candles(symbol):
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
@@ -26,7 +27,7 @@ def fetch_candles():
     resp = requests.get(url, params=params, timeout=30)
     data = resp.json()
     if "values" not in data:
-        raise RuntimeError(f"Twelve Data error: {data}")
+        raise RuntimeError(f"Twelve Data error for {symbol}: {data}")
     df = pd.DataFrame(data["values"])
     df = df.rename(columns={"datetime": "time"})
     for col in ["open", "high", "low", "close"]:
@@ -103,32 +104,41 @@ def send_telegram_message(text):
 
 
 def main():
-    df = fetch_candles()
-    latest_time = str(df["time"].iloc[-1])
-    latest_close = df["close"].iloc[-1]
-
     state = load_state()
     messages = []
 
-    for length in DI_LENGTHS:
-        plus_di, minus_di = compute_di(df, length)
-        signal = detect_crossover(plus_di, minus_di)
+    for symbol in SYMBOLS:
+        try:
+            df = fetch_candles(symbol)
+        except Exception as e:
+            print(f"Skipping {symbol}: {e}")
+            continue
 
-        state_key = f"last_signal_di{length}"
-        last_bar_key = f"last_bar_di{length}"
+        latest_time = str(df["time"].iloc[-1])
+        latest_close = df["close"].iloc[-1]
 
-        if signal and state.get(last_bar_key) != latest_time:
-            direction_fa = "صعودی (DI+ از بالای DI- عبور کرد)" if signal == "bullish" else "نزولی (DI- از بالای DI+ عبور کرد)"
-            messages.append(
-                f"سیگنال DMI (طول {length}): {direction_fa}\n"
-                f"قیمت: {latest_close:.2f}\n"
-                f"زمان کندل: {latest_time}"
-            )
-            state[state_key] = signal
-            state[last_bar_key] = latest_time
+        for length in DI_LENGTHS:
+            plus_di, minus_di = compute_di(df, length)
+            signal = detect_crossover(plus_di, minus_di)
+
+            state_key = f"last_signal_{symbol}_di{length}"
+            last_bar_key = f"last_bar_{symbol}_di{length}"
+
+            if signal and state.get(last_bar_key) != latest_time:
+                direction_fa = "صعودی (DI+ از بالای DI- عبور کرد)" if signal == "bullish" else "نزولی (DI- از بالای DI+ عبور کرد)"
+                messages.append(
+                    f"نماد: {symbol}\n"
+                    f"سیگنال DMI (طول {length}): {direction_fa}\n"
+                    f"قیمت: {latest_close:.5f}\n"
+                    f"زمان کندل: {latest_time}"
+                )
+                state[state_key] = signal
+                state[last_bar_key] = latest_time
+
+        time.sleep(1)
 
     if messages:
-        send_telegram_message("\n\n".join(messages))
+        send_telegram_message("\n\n---\n\n".join(messages))
         save_state(state)
     else:
         print("No new crossover signal.")
