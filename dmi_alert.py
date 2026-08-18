@@ -12,7 +12,7 @@ INTERVAL = "5min"
 OUTPUT_SIZE = 300
 STATE_FILE = "state.json"
 
-DI_LENGTHS = [14, 50]
+DI_LENGTHS = [100]
 
 
 def fetch_candles():
