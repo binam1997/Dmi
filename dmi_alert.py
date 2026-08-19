@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import requests
 import pandas as pd
 
@@ -9,32 +8,34 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
-TIMEFRAMES = ["3min", "5min"]
+INTERVAL = "3min"
 OUTPUT_SIZE = 500
 STATE_FILE = "state.json"
 
-DI_TREND_LENGTH = 100
-DI_TRIGGER_LENGTH = 14
+DI_LENGTH_A = 14
+DI_LENGTH_B = 100
+SMA_LENGTH = 100
 
 
-def fetch_candles(interval):
+def fetch_candles():
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
-        "interval": interval,
+        "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
     }
     resp = requests.get(url, params=params, timeout=30)
     data = resp.json()
     if "values" not in data:
-        raise RuntimeError(f"Twelve Data error for {SYMBOL} {interval}: {data}")
+        raise RuntimeError(f"Twelve Data error: {data}")
     df = pd.DataFrame(data["values"])
     df = df.rename(columns={"datetime": "time"})
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
     df["time"] = pd.to_datetime(df["time"])
     df = df.sort_values("time").reset_index(drop=True)
+    df = df.iloc[:-1].reset_index(drop=True)
     return df
 
 
@@ -74,12 +75,6 @@ def compute_di(df, length):
     return plus_di, minus_di
 
 
-def get_trend_state(plus_di, minus_di):
-    if plus_di.iloc[-1] > minus_di.iloc[-1]:
-        return "bullish"
-    return "bearish"
-
-
 def detect_crossover(plus_di, minus_di):
     diff_now = plus_di.iloc[-1] - minus_di.iloc[-1]
     diff_prev = plus_di.iloc[-2] - minus_di.iloc[-2]
@@ -89,6 +84,10 @@ def detect_crossover(plus_di, minus_di):
     if diff_prev >= 0 and diff_now < 0:
         return "bearish"
     return None
+
+
+def current_side(plus_di, minus_di):
+    return "bullish" if plus_di.iloc[-1] > minus_di.iloc[-1] else "bearish"
 
 
 def load_state():
@@ -110,50 +109,69 @@ def send_telegram_message(text):
     resp.raise_for_status()
 
 
+def fa_dir(direction):
+    return "صعودی" if direction == "bullish" else "نزولی"
+
+
 def main():
     state = load_state()
     messages = []
 
-    for interval in TIMEFRAMES:
-        try:
-            df = fetch_candles(interval)
-        except Exception as e:
-            print(f"Skipping {interval}: {e}")
-            continue
+    df = fetch_candles()
+    latest_time = str(df["time"].iloc[-1])
+    latest_close = df["close"].iloc[-1]
+    latest_high = df["high"].iloc[-1]
+    latest_low = df["low"].iloc[-1]
 
-        latest_time = str(df["time"].iloc[-1])
-        latest_close = df["close"].iloc[-1]
+    plus_di_a, minus_di_a = compute_di(df, DI_LENGTH_A)
+    plus_di_b, minus_di_b = compute_di(df, DI_LENGTH_B)
+    sma_b = df["close"].rolling(SMA_LENGTH).mean()
+    latest_sma = sma_b.iloc[-1]
 
-        plus_di_100, minus_di_100 = compute_di(df, DI_TREND_LENGTH)
-        trend_state = get_trend_state(plus_di_100, minus_di_100)
+    # ---- Condition 1: independent crossover alerts for DI14 and DI100 ----
+    cross_a = detect_crossover(plus_di_a, minus_di_a)
+    if cross_a is not None and state.get("cond1_last_bar_a") != latest_time:
+        messages.append(
+            f"طلا (XAU/USD) - 3min\n"
+            f"شرط ۱: تقاطع DI{DI_LENGTH_A} {fa_dir(cross_a)}\n"
+            f"قیمت: {latest_close:.2f}\n"
+            f"زمان کندل: {latest_time}"
+        )
+        state["cond1_last_bar_a"] = latest_time
 
-        plus_di_14, minus_di_14 = compute_di(df, DI_TRIGGER_LENGTH)
-        new_trigger = detect_crossover(plus_di_14, minus_di_14)
+    cross_b = detect_crossover(plus_di_b, minus_di_b)
+    if cross_b is not None and state.get("cond1_last_bar_b") != latest_time:
+        messages.append(
+            f"طلا (XAU/USD) - 3min\n"
+            f"شرط ۱: تقاطع DI{DI_LENGTH_B} {fa_dir(cross_b)}\n"
+            f"قیمت: {latest_close:.2f}\n"
+            f"زمان کندل: {latest_time}"
+        )
+        state["cond1_last_bar_b"] = latest_time
 
-        di14_dir_key = f"di14_dir_{interval}"
-        alerted_combo_key = f"alerted_combo_{interval}"
+    # ---- Condition 2: DI100 side and DI14 side aligned, every check ----
+    side_a = current_side(plus_di_a, minus_di_a)
+    side_b = current_side(plus_di_b, minus_di_b)
 
-        if new_trigger is not None:
-            state[di14_dir_key] = new_trigger
+    if side_a == side_b and state.get("cond2_last_bar") != latest_time:
+        messages.append(
+            f"طلا (XAU/USD) - 3min\n"
+            f"شرط ۲: DI{DI_LENGTH_B} و DI{DI_LENGTH_A} هم‌جهت {fa_dir(side_b)} هستند\n"
+            f"قیمت: {latest_close:.2f}\n"
+            f"زمان کندل: {latest_time}"
+        )
+        state["cond2_last_bar"] = latest_time
 
-        last_di14_dir = state.get(di14_dir_key)
-        combo = f"{last_di14_dir}_{trend_state}"
-
-        aligned = last_di14_dir is not None and last_di14_dir == trend_state
-
-        if aligned and state.get(alerted_combo_key) != combo:
-            direction_fa = "صعودی" if trend_state == "bullish" else "نزولی"
-            messages.append(
-                f"طلا (XAU/USD) - تایم‌فریم {interval}\n"
-                f"تأیید روند {direction_fa}: DI{DI_TRIGGER_LENGTH} قبلا {direction_fa} شده بود و حالا DI{DI_TREND_LENGTH} هم {direction_fa} است\n"
-                f"قیمت: {latest_close:.2f}\n"
-                f"زمان کندل: {latest_time}"
-            )
-            state[alerted_combo_key] = combo
-        elif not aligned:
-            state[alerted_combo_key] = None
-
-        time.sleep(1)
+    # ---- Condition 3: price touches SMA100, in the direction of DI100 ----
+    touched_sma = latest_low <= latest_sma <= latest_high
+    if touched_sma and state.get("cond3_last_bar") != latest_time:
+        messages.append(
+            f"طلا (XAU/USD) - 3min\n"
+            f"شرط ۳: قیمت به میانگین متحرک {SMA_LENGTH} برخورد کرد، DI{DI_LENGTH_B} {fa_dir(side_b)} است\n"
+            f"قیمت: {latest_close:.2f} (میانگین: {latest_sma:.2f})\n"
+            f"زمان کندل: {latest_time}"
+        )
+        state["cond3_last_bar"] = latest_time
 
     save_state(state)
 
