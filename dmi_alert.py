@@ -128,29 +128,37 @@ def main():
         trend_state = get_trend_state(plus_di_100, minus_di_100)
 
         plus_di_14, minus_di_14 = compute_di(df, DI_TRIGGER_LENGTH)
-        trigger_signal = detect_crossover(plus_di_14, minus_di_14)
+        new_trigger = detect_crossover(plus_di_14, minus_di_14)
 
-        state_key = f"last_signal_{interval}"
-        last_bar_key = f"last_bar_{interval}"
+        di14_dir_key = f"di14_dir_{interval}"
+        alerted_combo_key = f"alerted_combo_{interval}"
 
-        aligned = trigger_signal is not None and trigger_signal == trend_state
+        if new_trigger is not None:
+            state[di14_dir_key] = new_trigger
 
-        if aligned and state.get(last_bar_key) != latest_time:
+        last_di14_dir = state.get(di14_dir_key)
+        combo = f"{last_di14_dir}_{trend_state}"
+
+        aligned = last_di14_dir is not None and last_di14_dir == trend_state
+
+        if aligned and state.get(alerted_combo_key) != combo:
             direction_fa = "صعودی" if trend_state == "bullish" else "نزولی"
             messages.append(
                 f"طلا (XAU/USD) - تایم‌فریم {interval}\n"
-                f"تأیید روند {direction_fa}: DI{DI_TREND_LENGTH} از قبل {direction_fa} بود و DI{DI_TRIGGER_LENGTH} هم تازه {direction_fa} شد\n"
+                f"تأیید روند {direction_fa}: DI{DI_TRIGGER_LENGTH} قبلا {direction_fa} شده بود و حالا DI{DI_TREND_LENGTH} هم {direction_fa} است\n"
                 f"قیمت: {latest_close:.2f}\n"
                 f"زمان کندل: {latest_time}"
             )
-            state[state_key] = trend_state
-            state[last_bar_key] = latest_time
+            state[alerted_combo_key] = combo
+        elif not aligned:
+            state[alerted_combo_key] = None
 
         time.sleep(1)
 
+    save_state(state)
+
     if messages:
         send_telegram_message("\n\n---\n\n".join(messages))
-        save_state(state)
     else:
         print("No new signal.")
 
