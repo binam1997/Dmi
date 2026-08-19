@@ -9,11 +9,12 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
-TIMEFRAMES = ["1min", "5min"]
+TIMEFRAMES = ["3min", "5min"]
 OUTPUT_SIZE = 500
 STATE_FILE = "state.json"
 
-DI_LENGTH = 100
+DI_TREND_LENGTH = 100
+DI_TRIGGER_LENGTH = 14
 
 
 def fetch_candles(interval):
@@ -73,6 +74,12 @@ def compute_di(df, length):
     return plus_di, minus_di
 
 
+def get_trend_state(plus_di, minus_di):
+    if plus_di.iloc[-1] > minus_di.iloc[-1]:
+        return "bullish"
+    return "bearish"
+
+
 def detect_crossover(plus_di, minus_di):
     diff_now = plus_di.iloc[-1] - minus_di.iloc[-1]
     diff_prev = plus_di.iloc[-2] - minus_di.iloc[-2]
@@ -117,21 +124,26 @@ def main():
         latest_time = str(df["time"].iloc[-1])
         latest_close = df["close"].iloc[-1]
 
-        plus_di, minus_di = compute_di(df, DI_LENGTH)
-        signal = detect_crossover(plus_di, minus_di)
+        plus_di_100, minus_di_100 = compute_di(df, DI_TREND_LENGTH)
+        trend_state = get_trend_state(plus_di_100, minus_di_100)
+
+        plus_di_14, minus_di_14 = compute_di(df, DI_TRIGGER_LENGTH)
+        trigger_signal = detect_crossover(plus_di_14, minus_di_14)
 
         state_key = f"last_signal_{interval}"
         last_bar_key = f"last_bar_{interval}"
 
-        if signal and state.get(last_bar_key) != latest_time:
-            direction_fa = "صعودی (DI+ از بالای DI- عبور کرد)" if signal == "bullish" else "نزولی (DI- از بالای DI+ عبور کرد)"
+        aligned = trigger_signal is not None and trigger_signal == trend_state
+
+        if aligned and state.get(last_bar_key) != latest_time:
+            direction_fa = "صعودی" if trend_state == "bullish" else "نزولی"
             messages.append(
                 f"طلا (XAU/USD) - تایم‌فریم {interval}\n"
-                f"سیگنال DMI (طول {DI_LENGTH}): {direction_fa}\n"
+                f"تأیید روند {direction_fa}: DI{DI_TREND_LENGTH} از قبل {direction_fa} بود و DI{DI_TRIGGER_LENGTH} هم تازه {direction_fa} شد\n"
                 f"قیمت: {latest_close:.2f}\n"
                 f"زمان کندل: {latest_time}"
             )
-            state[state_key] = signal
+            state[state_key] = trend_state
             state[last_bar_key] = latest_time
 
         time.sleep(1)
