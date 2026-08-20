@@ -70,7 +70,7 @@ def get_data():
         "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
-        "timezone": "UTC"
+        "timezone": "Asia/Tehran"
     }
 
     response = requests.get(
