@@ -2,7 +2,11 @@ import os
 import json
 import requests
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+import numpy as np
+
+# =========================
+# SETTINGS
+# =========================
 
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -10,15 +14,30 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
 INTERVAL = "1min"
-OUTPUT_SIZE = 500
-STATE_FILE = "state.json"
 
-DI_LENGTH_A = 14
-DI_LENGTH_B = 100
-SMA_LENGTH = 100
+# Bollinger اصلی برای سیگنال
+BB_LENGTH = 50
+BB_STD = 2
+
+# BBW مطابق تنظیمات تصویر
+BBW_LENGTH = 20
+BBW_STD = 2
+
+# ADX
+ADX_LENGTH = 14
+
+# تعداد کندل دریافت شده
+OUTPUT_SIZE = 150
+
+# فایل جلوگیری از اسپم
+STATE_FILE = "alert_state.json"
 
 
-def fetch_candles():
+# =========================
+# GET MARKET DATA
+# =========================
+
+def get_data():
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -26,62 +45,95 @@ def fetch_candles():
         "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
+        "timezone": "UTC"
     }
 
-    resp = requests.get(url, params=params, timeout=30)
-    data = resp.json()
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
 
-    if "values" not in data:
-        raise RuntimeError(f"Twelve Data error: {data}")
+    data = response.json()
+
+    if data.get("status") != "ok":
+        raise Exception(f"TwelveData Error: {data}")
 
     df = pd.DataFrame(data["values"])
 
-    df = df.rename(columns={"datetime": "time"})
-
     for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["time"] = pd.to_datetime(df["time"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
 
-    df = df.sort_values("time").reset_index(drop=True)
-
-    # حذف کندل در حال تشکیل
-    df = df.iloc[:-1].reset_index(drop=True)
+    # از قدیمی به جدید
+    df = df.sort_values("datetime").reset_index(drop=True)
 
     return df
 
 
-def wilder_smooth(series, length):
+# =========================
+# EMA
+# =========================
+
+def ema(series, length):
     return series.ewm(
-        alpha=1 / length,
+        span=length,
         adjust=False
     ).mean()
 
 
-def compute_di(df, length):
+# =========================
+# BOLLINGER 50 EMA
+# =========================
+
+def calculate_bollinger(df):
+
+    basis = ema(df["close"], BB_LENGTH)
+
+    std = df["close"].rolling(BB_LENGTH).std(ddof=0)
+
+    upper = basis + BB_STD * std
+    lower = basis - BB_STD * std
+
+    df["bb_basis"] = basis
+    df["bb_upper"] = upper
+    df["bb_lower"] = lower
+
+    return df
+
+
+# =========================
+# BBW
+# =========================
+
+def calculate_bbw(df):
+
+    # BBW استاندارد:
+    # (Upper - Lower) / Middle * 100
+
+    basis = df["close"].rolling(BBW_LENGTH).mean()
+
+    std = df["close"].rolling(BBW_LENGTH).std(ddof=0)
+
+    upper = basis + BBW_STD * std
+    lower = basis - BBW_STD * std
+
+    df["bbw"] = ((upper - lower) / basis) * 100
+
+    return df
+
+
+# =========================
+# ADX 14 + DI
+# =========================
+
+def calculate_adx(df):
 
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
-    prev_high = high.shift(1)
-    prev_low = low.shift(1)
     prev_close = close.shift(1)
 
-    up_move = high - prev_high
-    down_move = prev_low - low
-
-    plus_dm = (
-        ((up_move > down_move) & (up_move > 0)) * up_move
-    )
-
-    minus_dm = (
-        ((down_move > up_move) & (down_move > 0)) * down_move
-    )
-
-    plus_dm = plus_dm.fillna(0)
-    minus_dm = minus_dm.fillna(0)
-
+    # True Range
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
@@ -91,71 +143,97 @@ def compute_di(df, length):
         axis=1
     ).max(axis=1)
 
-    smoothed_tr = wilder_smooth(tr, length)
+    # Directional Movement
+    up_move = high.diff()
+    down_move = -low.diff()
 
-    smoothed_plus_dm = wilder_smooth(
+    plus_dm = np.where(
+        (up_move > down_move) & (up_move > 0),
+        up_move,
+        0
+    )
+
+    minus_dm = np.where(
+        (down_move > up_move) & (down_move > 0),
+        down_move,
+        0
+    )
+
+    plus_dm = pd.Series(
         plus_dm,
-        length
+        index=df.index
     )
 
-    smoothed_minus_dm = wilder_smooth(
+    minus_dm = pd.Series(
         minus_dm,
-        length
+        index=df.index
     )
 
-    plus_di = 100 * (
-        smoothed_plus_dm / smoothed_tr
+    # Wilder smoothing
+    atr = tr.ewm(
+        alpha=1 / ADX_LENGTH,
+        adjust=False
+    ).mean()
+
+    plus_di = (
+        100
+        * plus_dm.ewm(
+            alpha=1 / ADX_LENGTH,
+            adjust=False
+        ).mean()
+        / atr
     )
 
-    minus_di = 100 * (
-        smoothed_minus_dm / smoothed_tr
+    minus_di = (
+        100
+        * minus_dm.ewm(
+            alpha=1 / ADX_LENGTH,
+            adjust=False
+        ).mean()
+        / atr
     )
 
-    return plus_di, minus_di
-
-
-def detect_crossover(plus_di, minus_di):
-
-    diff_now = (
-        plus_di.iloc[-1] -
-        minus_di.iloc[-1]
+    dx = (
+        100
+        * (plus_di - minus_di).abs()
+        / (plus_di + minus_di)
     )
 
-    diff_prev = (
-        plus_di.iloc[-2] -
-        minus_di.iloc[-2]
-    )
+    adx = dx.ewm(
+        alpha=1 / ADX_LENGTH,
+        adjust=False
+    ).mean()
 
-    if diff_prev <= 0 and diff_now > 0:
-        return "bullish"
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+    df["adx"] = adx
 
-    if diff_prev >= 0 and diff_now < 0:
-        return "bearish"
-
-    return None
+    return df
 
 
-def current_side(plus_di, minus_di):
-
-    if plus_di.iloc[-1] > minus_di.iloc[-1]:
-        return "bullish"
-
-    return "bearish"
-
+# =========================
+# STATE / ANTI SPAM
+# =========================
 
 def load_state():
 
-    if os.path.exists(STATE_FILE):
+    if not os.path.exists(STATE_FILE):
+        return {
+            "last_alert_key": None
+        }
 
+    try:
         with open(
             STATE_FILE,
             "r",
             encoding="utf-8"
         ) as f:
-
             return json.load(f)
 
-    return {}
+    except Exception:
+        return {
+            "last_alert_key": None
+        }
 
 
 def save_state(state):
@@ -169,12 +247,16 @@ def save_state(state):
         json.dump(
             state,
             f,
-            indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
+            indent=2
         )
 
 
-def send_telegram_message(text):
+# =========================
+# TELEGRAM
+# =========================
+
+def send_telegram(message):
 
     url = (
         f"https://api.telegram.org/"
@@ -183,249 +265,247 @@ def send_telegram_message(text):
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
+        "text": message
     }
 
-    resp = requests.post(
+    response = requests.post(
         url,
-        data=payload,
-        timeout=30
+        json=payload,
+        timeout=20
     )
 
-    resp.raise_for_status()
+    response.raise_for_status()
 
 
-def fa_dir(direction):
+# =========================
+# FIND SIGNAL
+# =========================
 
-    if direction == "bullish":
-        return "صعودی"
+def check_signal(df):
 
-    return "نزولی"
+    # آخرین کندل بسته شده
+    # چون داده TwelveData ممکن است کندل جاری را هم بدهد،
+    # آخرین کندل را کنار می‌گذاریم و کندل قبلی را بررسی می‌کنیم.
 
+    if len(df) < 60:
+        return None
+
+    index = len(df) - 2
+
+    candle = df.iloc[index]
+
+    # =========================
+    # STEP 1
+    # BOLLINGER TOUCH
+    # =========================
+
+    upper_touch = (
+        candle["high"] >= candle["bb_upper"]
+    )
+
+    lower_touch = (
+        candle["low"] <= candle["bb_lower"]
+    )
+
+    if not upper_touch and not lower_touch:
+        return None
+
+    # =========================
+    # STEP 2
+    # THREE CANDLES BEFORE TOUCH
+    # =========================
+
+    if index < 3:
+        return None
+
+    c3 = df.iloc[index - 3]
+    c2 = df.iloc[index - 2]
+    c1 = df.iloc[index - 1]
+
+    bbw_3 = c3["bbw"]
+    bbw_2 = c2["bbw"]
+    bbw_1 = c1["bbw"]
+
+    if pd.isna(bbw_3) or pd.isna(bbw_1):
+        return None
+
+    # =========================
+    # BBW TREND
+    # =========================
+
+    # مثال:
+    # 19 -> 18.5 -> 20
+    #
+    # چون ابتدا 19 بوده
+    # و انتها 20 شده
+    # روند را صعودی در نظر می گیریم.
+
+    bbw_rising = bbw_1 > bbw_3
+
+    if not bbw_rising:
+        return None
+
+    # =========================
+    # ADX / DI
+    # =========================
+
+    adx = candle["adx"]
+    plus_di = candle["plus_di"]
+    minus_di = candle["minus_di"]
+
+    if pd.isna(adx) or pd.isna(plus_di) or pd.isna(minus_di):
+        return None
+
+    if plus_di > minus_di:
+        di_status = "DI+ بالاتر از DI- است 🟢"
+        direction = "صعودی"
+    elif minus_di > plus_di:
+        di_status = "DI- بالاتر از DI+ است 🔴"
+        direction = "نزولی"
+    else:
+        di_status = "DI+ و DI- برابر هستند ⚪"
+        direction = "خنثی"
+
+    # =========================
+    # TOUCH TYPE
+    # =========================
+
+    if upper_touch and lower_touch:
+        touch_type = "همزمان Upper و Lower"
+        emoji = "⚠️"
+
+    elif upper_touch:
+        touch_type = "Upper Band"
+        emoji = "🔴"
+
+    else:
+        touch_type = "Lower Band"
+        emoji = "🟢"
+
+    # =========================
+    # ALERT KEY
+    # =========================
+
+    candle_time = str(
+        candle["datetime"]
+    )
+
+    alert_key = (
+        f"{candle_time}_{touch_type}"
+    )
+
+    return {
+        "alert_key": alert_key,
+        "time": candle_time,
+        "touch_type": touch_type,
+        "emoji": emoji,
+        "price": candle["close"],
+        "upper": candle["bb_upper"],
+        "lower": candle["bb_lower"],
+
+        "bbw_3": bbw_3,
+        "bbw_2": bbw_2,
+        "bbw_1": bbw_1,
+
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+
+        "di_status": di_status,
+        "direction": direction
+    }
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
 
+    print("Getting market data...")
+
+    df = get_data()
+
+    print("Calculating indicators...")
+
+    df = calculate_bollinger(df)
+    df = calculate_bbw(df)
+    df = calculate_adx(df)
+
+    signal = check_signal(df)
+
+    if signal is None:
+
+        print("No valid signal.")
+        return
+
     state = load_state()
-    messages = []
 
-    df = fetch_candles()
+    # جلوگیری از ارسال دوباره همان سیگنال
+    if state.get("last_alert_key") == signal["alert_key"]:
 
-    latest_time = str(
-        df["time"].iloc[-1]
-    )
-
-    latest_close = df["close"].iloc[-1]
-    latest_high = df["high"].iloc[-1]
-    latest_low = df["low"].iloc[-1]
-
-    # ==============================
-    # محاسبه DI14
-    # ==============================
-
-    plus_di_a, minus_di_a = compute_di(
-        df,
-        DI_LENGTH_A
-    )
-
-    # ==============================
-    # محاسبه DI100
-    # ==============================
-
-    plus_di_b, minus_di_b = compute_di(
-        df,
-        DI_LENGTH_B
-    )
-
-    # ==============================
-    # SMA100
-    # ==============================
-
-    sma_b = df["close"].rolling(
-        SMA_LENGTH
-    ).mean()
-
-    latest_sma = sma_b.iloc[-1]
-
-    # ==================================================
-    # CONDITION 1
-    # تقاطع مستقل DI14
-    # ==================================================
-
-    cross_a = detect_crossover(
-        plus_di_a,
-        minus_di_a
-    )
-
-    if (
-        cross_a is not None
-        and state.get("cond1_last_bar_a") != latest_time
-    ):
-
-        messages.append(
-            f"طلا (XAU/USD) - {INTERVAL}\n"
-            f"شرط ۱: تقاطع DI{DI_LENGTH_A} "
-            f"{fa_dir(cross_a)}\n"
-            f"قیمت: {latest_close:.2f}\n"
-            f"زمان کندل: {latest_time}"
+        print(
+            "Signal already sent. "
+            "Skipping duplicate alert."
         )
 
-        state["cond1_last_bar_a"] = latest_time
+        return
 
-    # ==================================================
-    # CONDITION 1
-    # تقاطع مستقل DI100
-    # ==================================================
+    # =========================
+    # TELEGRAM MESSAGE
+    # =========================
 
-    cross_b = detect_crossover(
-        plus_di_b,
-        minus_di_b
-    )
+    message = f"""
+🚨 XAU/USD ALERT
 
-    if (
-        cross_b is not None
-        and state.get("cond1_last_bar_b") != latest_time
-    ):
+{signal["emoji"]} برخورد با:
+{signal["touch_type"]}
 
-        messages.append(
-            f"طلا (XAU/USD) - {INTERVAL}\n"
-            f"شرط ۱: تقاطع DI{DI_LENGTH_B} "
-            f"{fa_dir(cross_b)}\n"
-            f"قیمت: {latest_close:.2f}\n"
-            f"زمان کندل: {latest_time}"
-        )
+💰 قیمت:
+{signal["price"]:.3f}
 
-        state["cond1_last_bar_b"] = latest_time
+📊 Bollinger 50 EMA
+Upper: {signal["upper"]:.3f}
+Lower: {signal["lower"]:.3f}
 
-    # ==================================================
-    # CONDITION 2
-    #
-    # DI100 = فیلتر روند
-    # DI14  = تریگر
-    #
-    # صعود:
-    # +DI100 > -DI100
-    # +DI14  > -DI14
-    #
-    # نزول:
-    # -DI100 > +DI100
-    # -DI14  > +DI14
-    #
-    # فقط هنگام تغییر وضعیت هشدار بده
-    # ==================================================
+📈 BBW — 3 کندل قبل:
+-3 : {signal["bbw_3"]:.4f}
+-2 : {signal["bbw_2"]:.4f}
+-1 : {signal["bbw_1"]:.4f}
 
-    di100_bullish = (
-        plus_di_b.iloc[-1] >
-        minus_di_b.iloc[-1]
-    )
+✅ BBW صعودی است
 
-    di14_bullish = (
-        plus_di_a.iloc[-1] >
-        minus_di_a.iloc[-1]
-    )
+━━━━━━━━━━━━━━
 
-    if di100_bullish and di14_bullish:
+📐 ADX 14:
+{signal["adx"]:.2f}
 
-        current_cond2 = "bullish"
+DI+:
+{signal["plus_di"]:.2f}
 
-        if state.get("cond2_state") != current_cond2:
+DI-:
+{signal["minus_di"]:.2f}
 
-            messages.append(
-                f"طلا (XAU/USD) - {INTERVAL}\n"
-                f"🟢 شرط ۲: سیگنال صعودی\n"
-                f"DI{DI_LENGTH_B}: صعودی\n"
-                f"DI{DI_LENGTH_A}: صعودی\n"
-                f"قیمت: {latest_close:.2f}\n"
-                f"زمان کندل: {latest_time}"
-            )
+{signal["di_status"]}
 
-            state["cond2_state"] = current_cond2
+📌 وضعیت DI:
+{signal["direction"]}
 
-    elif (
-        not di100_bullish
-        and not di14_bullish
-    ):
+⏱ زمان:
+{signal["time"]}
+""".strip()
 
-        current_cond2 = "bearish"
+    print(message)
 
-        if state.get("cond2_state") != current_cond2:
+    # اول تلگرام
+    send_telegram(message)
 
-            messages.append(
-                f"طلا (XAU/USD) - {INTERVAL}\n"
-                f"🔴 شرط ۲: سیگنال نزولی\n"
-                f"DI{DI_LENGTH_B}: نزولی\n"
-                f"DI{DI_LENGTH_A}: نزولی\n"
-                f"قیمت: {latest_close:.2f}\n"
-                f"زمان کندل: {latest_time}"
-            )
-
-            state["cond2_state"] = current_cond2
-
-    else:
-
-        # وضعیت بینابینی:
-        # DI14 و DI100 هم‌جهت نیستند
-        #
-        # آلارم نمی‌دهیم،
-        # اما وضعیت قبلی را پاک می‌کنیم
-        # تا اگر دوباره هم‌جهت شدند،
-        # آلارم جدید صادر شود.
-
-        state["cond2_state"] = "neutral"
-
-    # ==================================================
-    # CONDITION 3
-    #
-    # هر وقت قیمت SMA100 را لمس کند
-    # هشدار بده و وضعیت DI100 را اعلام کن
-    # ==================================================
-
-    touched_sma = (
-        latest_low <= latest_sma <= latest_high
-    )
-
-    if (
-        touched_sma
-        and state.get("cond3_last_bar") != latest_time
-    ):
-
-        side_b = current_side(
-            plus_di_b,
-            minus_di_b
-        )
-
-        messages.append(
-            f"طلا (XAU/USD) - {INTERVAL}\n"
-            f"شرط ۳: قیمت به SMA{SMA_LENGTH} "
-            f"برخورد کرد\n"
-            f"DI{DI_LENGTH_B}: "
-            f"{fa_dir(side_b)}\n"
-            f"قیمت: {latest_close:.2f}\n"
-            f"SMA{SMA_LENGTH}: "
-            f"{latest_sma:.2f}\n"
-            f"زمان کندل: {latest_time}"
-        )
-
-        state["cond3_last_bar"] = latest_time
-
-    # ==================================================
-    # ذخیره وضعیت
-    # ==================================================
+    # فقط بعد از موفقیت تلگرام state ذخیره می‌شود
+    state["last_alert_key"] = signal["alert_key"]
 
     save_state(state)
 
-    # ==================================================
-    # ارسال پیام
-    # ==================================================
-
-    if messages:
-
-        send_telegram_message(
-            "\n\n---\n\n".join(messages)
-        )
-
-    else:
-
-        print("No new signal.")
+    print("Alert sent successfully.")
 
 
 if __name__ == "__main__":
