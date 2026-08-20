@@ -16,6 +16,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SYMBOL = "XAU/USD"
 INTERVAL = "1min"
 
+
 # ---------------------------------------------------------
 # Strategy 1
 # Bollinger 50
@@ -24,19 +25,15 @@ INTERVAL = "1min"
 BB50_LENGTH = 50
 BB50_STD = 2
 
+
 # ---------------------------------------------------------
 # Strategy 2
-# Bollinger 25
+# Bollinger 100
 # ---------------------------------------------------------
 
-BB25_LENGTH = 25
-BB25_STD = 2
+BB100_LENGTH = 100
+BB100_STD = 2
 
-# تعداد کندل برای پیدا کردن کمترین عرض
-SQUEEZE_LOOKBACK = 20
-
-# تعداد کندل افزایش بعد از کمترین عرض
-EXPANSION_CONFIRM_CANDLES = 2
 
 # ---------------------------------------------------------
 # BBW
@@ -45,11 +42,13 @@ EXPANSION_CONFIRM_CANDLES = 2
 BBW_LENGTH = 20
 BBW_STD = 2
 
+
 # ---------------------------------------------------------
 # ADX
 # ---------------------------------------------------------
 
 ADX_LENGTH = 14
+
 
 # ---------------------------------------------------------
 
@@ -155,34 +154,28 @@ def calculate_bb50(df):
 
 
 # =========================================================
-# BOLLINGER 25 EMA
+# BOLLINGER 100 EMA
 # =========================================================
 
-def calculate_bb25(df):
+def calculate_bb100(df):
 
     basis = ema(
         df["close"],
-        BB25_LENGTH
+        BB100_LENGTH
     )
 
     std = df["close"].rolling(
-        BB25_LENGTH
+        BB100_LENGTH
     ).std(ddof=0)
 
-    df["bb25_mid"] = basis
+    df["bb100_mid"] = basis
 
-    df["bb25_upper"] = (
-        basis + BB25_STD * std
+    df["bb100_upper"] = (
+        basis + BB100_STD * std
     )
 
-    df["bb25_lower"] = (
-        basis - BB25_STD * std
-    )
-
-    # عرض باند
-    df["bb25_width"] = (
-        df["bb25_upper"]
-        - df["bb25_lower"]
+    df["bb100_lower"] = (
+        basis - BB100_STD * std
     )
 
     return df
@@ -231,7 +224,10 @@ def calculate_adx(df):
 
     prev_close = close.shift(1)
 
+    # -----------------------------------------------------
     # True Range
+    # -----------------------------------------------------
+
     tr1 = high - low
 
     tr2 = (
@@ -247,7 +243,9 @@ def calculate_adx(df):
         axis=1
     ).max(axis=1)
 
+    # -----------------------------------------------------
     # Directional Movement
+    # -----------------------------------------------------
 
     up_move = high.diff()
 
@@ -277,7 +275,9 @@ def calculate_adx(df):
         index=df.index
     )
 
+    # -----------------------------------------------------
     # Wilder smoothing
+    # -----------------------------------------------------
 
     atr = tr.ewm(
         alpha=1 / ADX_LENGTH,
@@ -345,6 +345,7 @@ def load_state():
             state = json.load(f)
 
         if "last_alert_keys" not in state:
+
             state["last_alert_keys"] = []
 
         return state
@@ -455,6 +456,10 @@ def check_bb50_touch(df, index):
 
     candle = df.iloc[index]
 
+    # -----------------------------------------------------
+    # برخورد با باند
+    # -----------------------------------------------------
+
     upper_touch = (
         candle["high"]
         >= candle["bb50_upper"]
@@ -468,7 +473,9 @@ def check_bb50_touch(df, index):
     if not upper_touch and not lower_touch:
         return None
 
-    # BBW باید قبل از برخورد صعودی باشد
+    # -----------------------------------------------------
+    # BBW باید صعودی باشد
+    # -----------------------------------------------------
 
     if not bbw_is_rising(
         df,
@@ -477,8 +484,14 @@ def check_bb50_touch(df, index):
 
         return None
 
+    # -----------------------------------------------------
+    # ADX / DI
+    # -----------------------------------------------------
+
     adx = candle["adx"]
+
     plus_di = candle["plus_di"]
+
     minus_di = candle["minus_di"]
 
     if (
@@ -506,6 +519,10 @@ def check_bb50_touch(df, index):
         di_status = (
             "DI+ و DI- برابر هستند ⚪"
         )
+
+    # -----------------------------------------------------
+    # نوع برخورد
+    # -----------------------------------------------------
 
     if upper_touch and lower_touch:
 
@@ -572,138 +589,50 @@ def check_bb50_touch(df, index):
 # =========================================================
 # STRATEGY 2
 #
-# BB25 SQUEEZE -> EXPANSION
+# BB100 TOUCH
+# +
+# BBW20 RISING
 #
-# 1. 20 کندل قبلی
-# 2. پیدا کردن کمترین Width
-# 3. بعد از Minimum حداقل 2 کندل افزایش
-# 4. Price از Midline عبور کرده
-# 5. DI جهت حرکت را تایید می کند
-# 6. BBW20 صعودی است
-#
+# دقیقاً مشابه Strategy 1
 # =========================================================
 
-def check_bb25_expansion(
-    df,
-    index
-):
+def check_bb100_touch(df, index):
 
-    # حداقل داده مورد نیاز
-
-    required = (
-        SQUEEZE_LOOKBACK
-        + EXPANSION_CONFIRM_CANDLES
-        + 5
-    )
-
-    if index < required:
+    if index < 5:
         return None
 
     candle = df.iloc[index]
 
-    previous = df.iloc[
-        index - 1
-    ]
-
     # -----------------------------------------------------
-    # 1. بیست کندل قبل از کندل فعلی
+    # برخورد با باند
     # -----------------------------------------------------
 
-    start = (
-        index - SQUEEZE_LOOKBACK
+    upper_touch = (
+        candle["high"]
+        >= candle["bb100_upper"]
     )
 
-    end = index
+    lower_touch = (
+        candle["low"]
+        <= candle["bb100_lower"]
+    )
 
-    widths = df.iloc[
-        start:end
-    ]["bb25_width"].copy()
-
-    if widths.isna().any():
+    if not upper_touch and not lower_touch:
         return None
 
     # -----------------------------------------------------
-    # 2. کمترین عرض
+    # BBW باید صعودی باشد
     # -----------------------------------------------------
 
-    min_position = widths.idxmin()
-
-    min_width = widths.loc[
-        min_position
-    ]
-
-    # موقعیت کمترین عرض نسبت به بازه
-    min_index = df.index.get_loc(
-        min_position
-    )
-
-    # -----------------------------------------------------
-    # 3. بررسی Expansion
-    # -----------------------------------------------------
-
-    # باید بعد از Minimum حداقل
-    # 2 کندل افزایش داشته باشیم.
-
-    expansion_count = 0
-
-    current_position = index - 1
-
-    while current_position > min_position:
-
-        current_width = df.iloc[
-            current_position
-        ]["bb25_width"]
-
-        previous_width = df.iloc[
-            current_position - 1
-        ]["bb25_width"]
-
-        if current_width > previous_width:
-
-            expansion_count += 1
-
-            current_position -= 1
-
-        else:
-
-            break
-
-    if expansion_count < EXPANSION_CONFIRM_CANDLES:
-
-        return None
-
-    # اطمینان از اینکه Expansion
-    # واقعاً بعد از Minimum اتفاق افتاده
-
-    if min_position >= index:
+    if not bbw_is_rising(
+        df,
+        index
+    ):
 
         return None
 
     # -----------------------------------------------------
-    # 4. Cross Midline
-    # -----------------------------------------------------
-
-    bullish_cross = (
-        previous["close"]
-        <= previous["bb25_mid"]
-        and
-        candle["close"]
-        > candle["bb25_mid"]
-    )
-
-    bearish_cross = (
-        previous["close"]
-        >= previous["bb25_mid"]
-        and
-        candle["close"]
-        < candle["bb25_mid"]
-    )
-
-    if not bullish_cross and not bearish_cross:
-        return None
-
-    # -----------------------------------------------------
-    # 5. ADX / DI
+    # ADX / DI
     # -----------------------------------------------------
 
     adx = candle["adx"]
@@ -720,102 +649,79 @@ def check_bb25_expansion(
 
         return None
 
-    # -----------------------------------------------------
-    # جهت سیگنال
-    # -----------------------------------------------------
-
-    if bullish_cross:
-
-        if plus_di <= minus_di:
-            return None
-
-        direction = "صعودی 🟢"
+    if plus_di > minus_di:
 
         di_status = (
-            "DI+ بالاتر از DI- است"
+            "DI+ بالاتر از DI- است 🟢"
+        )
+
+    elif minus_di > plus_di:
+
+        di_status = (
+            "DI- بالاتر از DI+ است 🔴"
         )
 
     else:
 
-        if minus_di <= plus_di:
-            return None
-
-        direction = "نزولی 🔴"
-
         di_status = (
-            "DI- بالاتر از DI+ است"
+            "DI+ و DI- برابر هستند ⚪"
         )
 
     # -----------------------------------------------------
-    # 6. BBW20 Rising
+    # نوع برخورد
     # -----------------------------------------------------
 
-    if not bbw_is_rising(
-        df,
-        index
-    ):
+    if upper_touch and lower_touch:
 
-        return None
+        touch = "Upper + Lower"
 
-    bbw_old = df.iloc[
-        index - 3
-    ]["bbw20"]
+        emoji = "⚠️"
 
-    bbw_mid = df.iloc[
-        index - 2
-    ]["bbw20"]
+    elif upper_touch:
 
-    bbw_new = df.iloc[
-        index - 1
-    ]["bbw20"]
+        touch = "Upper Band"
 
-    # -----------------------------------------------------
-    # Alert Key
-    # -----------------------------------------------------
+        emoji = "🔴"
+
+    else:
+
+        touch = "Lower Band"
+
+        emoji = "🟢"
 
     candle_time = str(
         candle["datetime"]
     )
 
     alert_key = (
-        f"BB25_EXPANSION_"
-        f"{candle_time}_"
-        f"{direction}"
+        f"BB100_{candle_time}_{touch}"
     )
 
     return {
 
-        "type": "BB25 EXPANSION",
+        "type": "BB100 TOUCH",
 
         "alert_key": alert_key,
 
         "time": candle_time,
 
-        "direction": direction,
+        "touch": touch,
+
+        "emoji": emoji,
 
         "price": candle["close"],
 
-        "bb25_mid": candle["bb25_mid"],
+        "bbw_old": df.iloc[
+            index - 3
+        ]["bbw20"],
 
-        "bb25_width": candle["bb25_width"],
+        "bbw_mid": df.iloc[
+            index - 2
+        ]["bbw20"],
 
-        "min_width": min_width,
-
-        "min_width_time": str(
-            df.loc[
-                min_position,
-                "datetime"
-            ]
-        ),
-
-        "expansion_count":
-            expansion_count,
-
-        "bbw_old": bbw_old,
-
-        "bbw_mid": bbw_mid,
-
-        "bbw_new": bbw_new,
+        "bbw_new": df.iloc[
+            index - 1
+        ]["bbw20"],
 
         "adx": adx,
 
@@ -843,11 +749,27 @@ def main():
         "Calculating indicators..."
     )
 
+    # -----------------------------------------------------
+    # Bollinger 50
+    # -----------------------------------------------------
+
     df = calculate_bb50(df)
 
-    df = calculate_bb25(df)
+    # -----------------------------------------------------
+    # Bollinger 100
+    # -----------------------------------------------------
+
+    df = calculate_bb100(df)
+
+    # -----------------------------------------------------
+    # BBW20
+    # -----------------------------------------------------
 
     df = calculate_bbw(df)
+
+    # -----------------------------------------------------
+    # ADX14
+    # -----------------------------------------------------
 
     df = calculate_adx(df)
 
@@ -875,7 +797,7 @@ def main():
     # Strategy 2
     # -----------------------------------------------------
 
-    signal_2 = check_bb25_expansion(
+    signal_2 = check_bb100_touch(
         df,
         index
     )
@@ -887,10 +809,20 @@ def main():
     signals = []
 
     if signal_1 is not None:
-        signals.append(signal_1)
+
+        signals.append(
+            signal_1
+        )
 
     if signal_2 is not None:
-        signals.append(signal_2)
+
+        signals.append(
+            signal_2
+        )
+
+    # -----------------------------------------------------
+    # هیچ سیگنالی وجود ندارد
+    # -----------------------------------------------------
 
     if not signals:
 
@@ -913,13 +845,19 @@ def main():
         )
     )
 
+    # =====================================================
+    # SEND SIGNALS
+    # =====================================================
+
     for signal in signals:
 
         alert_key = signal[
             "alert_key"
         ]
 
+        # -------------------------------------------------
         # جلوگیری از اسپم
+        # -------------------------------------------------
 
         if alert_key in sent_keys:
 
@@ -931,25 +869,29 @@ def main():
             continue
 
         # =================================================
-        # MESSAGE - STRATEGY 1
+        # MESSAGE
         # =================================================
 
-        if signal["type"] == "BB50 TOUCH":
-
-            message = f"""
+        message = f"""
 🚨 XAU/USD ALERT
 
 {signal["emoji"]} برخورد قیمت با:
 {signal["touch"]}
 
+📊 Strategy:
+{signal["type"]}
+
 💰 قیمت:
 {signal["price"]:.3f}
 
 ━━━━━━━━━━━━━━
 
-📊 BB50 EMA
+📈 Bollinger Band
 
-📈 BBW20 — سه کندل قبل:
+{"BB50 EMA" if signal["type"] == "BB50 TOUCH" else "BB100 EMA"}
+
+📊 BBW20 — سه کندل قبل:
+
 -3 : {signal["bbw_old"]:.4f}
 -2 : {signal["bbw_mid"]:.4f}
 -1 : {signal["bbw_new"]:.4f}
@@ -969,84 +911,27 @@ DI-:
 
 {signal["di_status"]}
 
-⏱ {signal["time"]}
-""".strip()
-
-        # =================================================
-        # MESSAGE - STRATEGY 2
-        # =================================================
-
-        else:
-
-            message = f"""
-🚨 XAU/USD EXPANSION ALERT
-
-🔥 Bollinger 25
-SQUEEZE → EXPANSION
-
-📌 جهت:
-{signal["direction"]}
-
-💰 قیمت:
-{signal["price"]:.3f}
-
 ━━━━━━━━━━━━━━
-
-📊 BB25 EMA
-
-Midline:
-{signal["bb25_mid"]:.3f}
-
-Current Width:
-{signal["bb25_width"]:.4f}
-
-Minimum Width:
-{signal["min_width"]:.4f}
-
-Minimum Width Time:
-{signal["min_width_time"]}
-
-📈 Expansion:
-{signal["expansion_count"]} کندل متوالی
-
-━━━━━━━━━━━━━━
-
-📍 BBW20 — سه کندل قبل:
-
--3 : {signal["bbw_old"]:.4f}
--2 : {signal["bbw_mid"]:.4f}
--1 : {signal["bbw_new"]:.4f}
-
-✅ BBW صعودی است
-
-━━━━━━━━━━━━━━
-
-📐 ADX 14:
-{signal["adx"]:.2f}
-
-DI+:
-{signal["plus_di"]:.2f}
-
-DI-:
-{signal["minus_di"]:.2f}
-
-{signal["di_status"]}
 
 ⏱ {signal["time"]}
 """.strip()
 
         # -------------------------------------------------
-        # Send Telegram
+        # چاپ در Console
         # -------------------------------------------------
 
         print(message)
+
+        # -------------------------------------------------
+        # ارسال تلگرام
+        # -------------------------------------------------
 
         send_telegram(
             message
         )
 
         # -------------------------------------------------
-        # Save state
+        # ذخیره Alert Key
         # -------------------------------------------------
 
         sent_keys.add(
@@ -1066,7 +951,7 @@ DI-:
         sent_keys
     )[-100:]
 
-    save_state(
+        save_state(
         state
     )
 
