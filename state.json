@@ -107,9 +107,9 @@
   ],
   "band_status": {
     "bb50_upper_status": "none",
-    "bb50_lower_status": "reject",
+    "bb50_lower_status": "ride",
     "bb100_upper_status": "none",
     "bb100_lower_status": "ride"
   },
-  "last_candle_time": "2026-08-21 16:05:00"
+  "last_candle_time": "2026-08-21 16:07:00"
 }
