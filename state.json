@@ -109,7 +109,7 @@
     "bb50_upper_status": "none",
     "bb50_lower_status": "none",
     "bb100_upper_status": "none",
-    "bb100_lower_status": "reject"
+    "bb100_lower_status": "none"
   },
-  "last_candle_time": "2026-08-21 16:13:00"
+  "last_candle_time": "2026-08-21 16:15:00"
 }
