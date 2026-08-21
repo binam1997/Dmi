@@ -104,5 +104,12 @@
     "BB50_2026-08-20 21:52:00_Lower Band",
     "BB50_2026-08-21 10:08:00_Upper Band",
     "BB50_2026-08-21 10:50:00_Upper Band"
-  ]
+  ],
+  "band_status": {
+    "bb50_upper_status": "none",
+    "bb50_lower_status": "none",
+    "bb100_upper_status": "none",
+    "bb100_lower_status": "none"
+  },
+  "last_candle_time": "2026-08-21 08:48:00"
 }
