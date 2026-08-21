@@ -20,65 +20,69 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SYMBOL = "XAU/USD"
 INTERVAL = "1min"
 
+# تنظیمات WPR و Bollinger Bands
+WPR_PERIOD = 200
+WPR_MA_PERIOD = 3
+WPR_MA_TYPE = "EMA"
 
-# ---------------------------------------------------------
-# Strategy 1
-# Bollinger 50
-# ---------------------------------------------------------
+BB_PERIOD = 50
+BB_STD = 1.0
+BB_MA_TYPE = "EMA"
 
-BB50_LENGTH = 50
-BB50_STD = 2
-
-
-# ---------------------------------------------------------
-# Strategy 2
-# Bollinger 100
-# ---------------------------------------------------------
-
-BB100_LENGTH = 100
-BB100_STD = 2
-
-
-# ---------------------------------------------------------
-# BBW
-# ---------------------------------------------------------
-
-BBW_LENGTH = 20
-BBW_STD = 2
-
-
-# ---------------------------------------------------------
-# ADX
-# ---------------------------------------------------------
-
-ADX_LENGTH = 14
-
-
-# ---------------------------------------------------------
-
-OUTPUT_SIZE = 200
+OUTPUT_SIZE = 300
 
 STATE_FILE = "state.json"
 
-# حداقل تعداد کندل لازم برای اینکه همه اندیکاتورها معتبر باشند
-MIN_WARMUP = max(
-    BB100_LENGTH,
-    BBW_LENGTH,
-    ADX_LENGTH
-) + 5
-
-
-# ---------------------------------------------------------
-# وضعیت های ممکن برای هر باند
-# ---------------------------------------------------------
-
-STATUS_NONE = "none"
-STATUS_RIDE = "ride"
-STATUS_REJECT = "reject"
+# حداقل تعداد کندل لازم تا WPR + Bollinger روی آن هر دو معتبر باشند
+MIN_WARMUP = WPR_PERIOD + BB_PERIOD + 5
 
 
 # =========================================================
-# GET MARKET DATA
+# STATE & CONSTANTS
+# =========================================================
+
+STATE_NONE = "NONE"
+STATE_ABOVE_UPPER = "ABOVE_UPPER"
+STATE_INSIDE = "INSIDE"
+STATE_BELOW_LOWER = "BELOW_LOWER"
+
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+
+        return {
+            "last_position": STATE_NONE
+        }
+
+    try:
+
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+
+            state = json.load(f)
+
+        if "last_position" not in state:
+
+            state["last_position"] = STATE_NONE
+
+        return state
+
+    except Exception:
+
+        return {
+            "last_position": STATE_NONE
+        }
+
+
+def save_state(state):
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# =========================================================
+# DATA & INDICATORS
 # =========================================================
 
 def get_data():
@@ -93,355 +97,73 @@ def get_data():
         "timezone": "Asia/Tehran"
     }
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20
-    )
+    response = requests.get(url, params=params, timeout=20)
 
     response.raise_for_status()
 
     data = response.json()
 
     if data.get("status") != "ok":
-        raise Exception(
-            f"TwelveData Error: {data}"
-        )
+        raise Exception(f"TwelveData Error: {data}")
 
     df = pd.DataFrame(data["values"])
 
-    for col in [
-        "open",
-        "high",
-        "low",
-        "close"
-    ]:
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(IRAN_TZ)
+
+    df = df.sort_values("datetime").reset_index(drop=True)
+
+    return df
+
+
+def get_ma(series, length, ma_type):
+
+    if ma_type == "EMA":
+
+        return series.ewm(span=length, adjust=False).mean()
+
+    elif ma_type == "WMA":
+
+        weights = np.arange(1, length + 1)
+
+        return series.rolling(length).apply(
+            lambda x: np.dot(x, weights) / weights.sum(),
+            raw=True
         )
 
-    df["datetime"] = pd.to_datetime(
-        df["datetime"]
-    ).dt.tz_localize(
-        IRAN_TZ
-    )
+    elif ma_type == "RMA":
 
-    df = df.sort_values(
-        "datetime"
-    ).reset_index(drop=True)
+        return series.ewm(alpha=1 / length, adjust=False).mean()
 
-    return df
+    else:  # SMA
+
+        return series.rolling(length).mean()
 
 
-# =========================================================
-# EMA
-# =========================================================
+def calculate_wpr_bb(df):
 
-def ema(series, length):
+    # ۱. محاسبه Williams %R پایه
+    highest_high = df["high"].rolling(WPR_PERIOD).max()
+    lowest_low = df["low"].rolling(WPR_PERIOD).min()
 
-    return series.ewm(
-        span=length,
-        adjust=False
-    ).mean()
+    wpr_raw = 100 * (df["close"] - highest_high) / (highest_high - lowest_low)
 
+    # ۲. نرمالسازی بازه به [-100, 100] و اعمال MA
+    wpr_scaled = (wpr_raw + 50.0) * 2.0
 
-# =========================================================
-# BOLLINGER 50 EMA
-# =========================================================
+    df["signal_line"] = get_ma(wpr_scaled, WPR_MA_PERIOD, WPR_MA_TYPE)
 
-def calculate_bb50(df):
+    # ۳. محاسبه باند بولینگر روی خط سیگنال
+    basis = get_ma(df["signal_line"], BB_PERIOD, BB_MA_TYPE)
 
-    basis = ema(
-        df["close"],
-        BB50_LENGTH
-    )
+    dev = BB_STD * df["signal_line"].rolling(BB_PERIOD).std(ddof=1)
 
-    std = df["close"].rolling(
-        BB50_LENGTH
-    ).std(ddof=1)
-
-    df["bb50_mid"] = basis
-
-    df["bb50_upper"] = (
-        basis + BB50_STD * std
-    )
-
-    df["bb50_lower"] = (
-        basis - BB50_STD * std
-    )
+    df["bb_upper"] = basis + dev
+    df["bb_lower"] = basis - dev
 
     return df
-
-
-# =========================================================
-# BOLLINGER 100 EMA
-# =========================================================
-
-def calculate_bb100(df):
-
-    basis = ema(
-        df["close"],
-        BB100_LENGTH
-    )
-
-    std = df["close"].rolling(
-        BB100_LENGTH
-    ).std(ddof=1)
-
-    df["bb100_mid"] = basis
-
-    df["bb100_upper"] = (
-        basis + BB100_STD * std
-    )
-
-    df["bb100_lower"] = (
-        basis - BB100_STD * std
-    )
-
-    return df
-
-
-# =========================================================
-# BBW 20
-# =========================================================
-
-def calculate_bbw(df):
-
-    basis = df["close"].rolling(
-        BBW_LENGTH
-    ).mean()
-
-    std = df["close"].rolling(
-        BBW_LENGTH
-    ).std(ddof=1)
-
-    upper = (
-        basis + BBW_STD * std
-    )
-
-    lower = (
-        basis - BBW_STD * std
-    )
-
-    df["bbw20"] = (
-        (upper - lower)
-        / basis
-        * 100
-    )
-
-    return df
-
-
-# =========================================================
-# ADX 14 + DI
-# =========================================================
-
-def calculate_adx(df):
-
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    prev_close = close.shift(1)
-
-    # -----------------------------------------------------
-    # True Range
-    # -----------------------------------------------------
-
-    tr1 = high - low
-
-    tr2 = (
-        high - prev_close
-    ).abs()
-
-    tr3 = (
-        low - prev_close
-    ).abs()
-
-    tr = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
-    ).max(axis=1)
-
-    # -----------------------------------------------------
-    # Directional Movement
-    # -----------------------------------------------------
-
-    up_move = high.diff()
-
-    down_move = -low.diff()
-
-    plus_dm = np.where(
-        (up_move > down_move)
-        & (up_move > 0),
-        up_move,
-        0
-    )
-
-    minus_dm = np.where(
-        (down_move > up_move)
-        & (down_move > 0),
-        down_move,
-        0
-    )
-
-    plus_dm = pd.Series(
-        plus_dm,
-        index=df.index
-    )
-
-    minus_dm = pd.Series(
-        minus_dm,
-        index=df.index
-    )
-
-    # -----------------------------------------------------
-    # Wilder smoothing
-    # -----------------------------------------------------
-
-    atr = tr.ewm(
-        alpha=1 / ADX_LENGTH,
-        adjust=False
-    ).mean()
-
-    plus_di = (
-        100
-        * plus_dm.ewm(
-            alpha=1 / ADX_LENGTH,
-            adjust=False
-        ).mean()
-        / atr
-    )
-
-    minus_di = (
-        100
-        * minus_dm.ewm(
-            alpha=1 / ADX_LENGTH,
-            adjust=False
-        ).mean()
-        / atr
-    )
-
-    di_sum = plus_di + minus_di
-
-    dx = np.where(
-        di_sum == 0,
-        0,
-        100 * (plus_di - minus_di).abs() / di_sum
-    )
-
-    dx = pd.Series(
-        dx,
-        index=df.index
-    )
-
-    adx = dx.ewm(
-        alpha=1 / ADX_LENGTH,
-        adjust=False
-    ).mean()
-
-    df["plus_di"] = plus_di
-    df["minus_di"] = minus_di
-    df["adx"] = adx
-
-    return df
-
-
-# =========================================================
-# STATE
-#
-# ساختار:
-#
-# {
-#   "last_candle_time": "...",
-#   "band_status": {
-#       "bb50_upper_status": "none" | "ride" | "reject",
-#       "bb50_lower_status": "none" | "ride" | "reject",
-#       "bb100_upper_status": "none" | "ride" | "reject",
-#       "bb100_lower_status": "none" | "ride" | "reject"
-#   }
-# }
-#
-# آلارم فقط وقتی ارسال می شود که وضعیت یک باند
-# نسبت به کندل قبلی عوض شده باشد (نه هر بار که همان
-# وضعیت تکرار شود).
-# =========================================================
-
-DEFAULT_BAND_STATUS = {
-    "bb50_upper_status": STATUS_NONE,
-    "bb50_lower_status": STATUS_NONE,
-    "bb100_upper_status": STATUS_NONE,
-    "bb100_lower_status": STATUS_NONE
-}
-
-
-def load_state():
-
-    if not os.path.exists(
-        STATE_FILE
-    ):
-
-        return {
-            "last_candle_time": None,
-            "band_status": dict(
-                DEFAULT_BAND_STATUS
-            )
-        }
-
-    try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            state = json.load(f)
-
-        if "band_status" not in state:
-
-            state["band_status"] = dict(
-                DEFAULT_BAND_STATUS
-            )
-
-        for key in DEFAULT_BAND_STATUS:
-
-            if key not in state["band_status"]:
-
-                state["band_status"][key] = STATUS_NONE
-
-        if "last_candle_time" not in state:
-
-            state["last_candle_time"] = None
-
-        return state
-
-    except Exception:
-
-        return {
-            "last_candle_time": None,
-            "band_status": dict(
-                DEFAULT_BAND_STATUS
-            )
-        }
-
-
-def save_state(state):
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
 
 
 # =========================================================
@@ -450,23 +172,11 @@ def save_state(state):
 
 def send_telegram(message):
 
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
 
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=20
-    )
-
-    response.raise_for_status()
+    requests.post(url, json=payload, timeout=20).raise_for_status()
 
 
 def send_error_alert(error_text):
@@ -474,7 +184,7 @@ def send_error_alert(error_text):
     try:
 
         send_telegram(
-            f"⚠️ ربات XAU/USD خطا داد:\n\n{error_text}"
+            f"⚠️ ربات WPRBB خطا داد:\n\n{error_text}"
         )
 
     except Exception:
@@ -483,254 +193,71 @@ def send_error_alert(error_text):
         pass
 
 
-# =========================================================
-# BBW TREND
-#
-# سه کندل قبل از سیگنال را بررسی می کنیم.
-# لازم نیست هر قدم تک تک صعودی باشد (یک دیپ کوچک در وسط
-# اشکالی ندارد)، فقط روند میانگینِ این سه کندل باید رو به
-# بالا باشد.
-#
-# روی سه نقطه ی هم فاصله، "میانگین صعودی" از نظر ریاضی
-# معادل مقایسه ی فقط قدیمی ترین و جدیدترین مقدار است
-# (مقدار میانی در میانگین گیری حذف می شود).
-# =========================================================
-
-def bbw_is_rising(df, index):
-
-    if index < 3:
-        return False
-
-    bbw_old = df.iloc[
-        index - 3
-    ]["bbw20"]
-
-    bbw_mid = df.iloc[
-        index - 2
-    ]["bbw20"]
-
-    bbw_new = df.iloc[
-        index - 1
-    ]["bbw20"]
-
-    if (
-        pd.isna(bbw_old)
-        or pd.isna(bbw_mid)
-        or pd.isna(bbw_new)
-    ):
-
-        return False
-
-    return bbw_new > bbw_old
-
-
-# =========================================================
-# DI STATUS TEXT
-# =========================================================
-
-def di_status_text(plus_di, minus_di):
-
-    if plus_di > minus_di:
-
-        return "DI+ بالاتر از DI- است 🟢"
-
-    elif minus_di > plus_di:
-
-        return "DI- بالاتر از DI+ است 🔴"
-
-    return "DI+ و DI- برابر هستند ⚪"
-
-
-# =========================================================
-# طبقه بندی برخورد یک باند
-#
-# none    -> اصلا لمس نشده
-# ride    -> لمس شده و بادی کندل هم بیرون از باند کلوز کرده
-#            (احتمال ادامه ی روند، قیمت دارد "سوار" باند می شود)
-# reject  -> فقط فتیله لمس کرده، کلوز داخل باند برگشته
-#            (احتمال برگشت روند)
-# =========================================================
-
-def classify_band(high, low, close, band_value, side):
-
-    if side == "upper":
-
-        touched = high >= band_value
-        closed_beyond = close > band_value
-
-    else:
-
-        touched = low <= band_value
-        closed_beyond = close < band_value
-
-    if not touched:
-        return STATUS_NONE
-
-    if closed_beyond:
-        return STATUS_RIDE
-
-    return STATUS_REJECT
-
-
-# =========================================================
-# STRATEGY CHECK (مشترک برای BB50 و BB100)
-# =========================================================
-
-def check_band_touch(df, index, upper_col, lower_col, label):
-
-    candle = df.iloc[index]
-
-    upper_status = classify_band(
-        candle["high"],
-        candle["low"],
-        candle["close"],
-        candle[upper_col],
-        "upper"
-    )
-
-    lower_status = classify_band(
-        candle["high"],
-        candle["low"],
-        candle["close"],
-        candle[lower_col],
-        "lower"
-    )
-
-    adx = candle["adx"]
-    plus_di = candle["plus_di"]
-    minus_di = candle["minus_di"]
-
-    bbw_ok = bbw_is_rising(
-        df,
-        index
-    )
-
-    indicators_ok = (
-        bbw_ok
-        and not pd.isna(adx)
-        and not pd.isna(plus_di)
-        and not pd.isna(minus_di)
-    )
-
-    return {
-        "type": label,
-        "upper_status": upper_status,
-        "lower_status": lower_status,
-        "indicators_ok": indicators_ok,
-        "price": candle["close"],
-        "time": candle["datetime"].strftime("%Y-%m-%d %H:%M:%S"),
-        "bbw_old": df.iloc[index - 3]["bbw20"] if index >= 3 else np.nan,
-        "bbw_mid": df.iloc[index - 2]["bbw20"] if index >= 2 else np.nan,
-        "bbw_new": df.iloc[index - 1]["bbw20"] if index >= 1 else np.nan,
-        "adx": adx,
-        "plus_di": plus_di,
-        "minus_di": minus_di,
-        "di_status": di_status_text(plus_di, minus_di)
-    }
-
-
-# =========================================================
-# متن پیام بر اساس side ("upper"/"lower") و status ("ride"/"reject")
-# =========================================================
-
-def band_headline(side, status):
-
-    if side == "upper" and status == STATUS_RIDE:
-
-        return (
-            "🟢🚀 سوار باند بالا شد",
-            "احتمال ادامه ی روند صعودی"
-        )
-
-    if side == "upper" and status == STATUS_REJECT:
-
-        return (
-            "🔴↩️ رد شد از باند بالا",
-            "احتمال برگشت روند"
-        )
-
-    if side == "lower" and status == STATUS_RIDE:
-
-        return (
-            "🔴🚀 سوار باند پایین شد",
-            "احتمال ادامه ی روند نزولی"
-        )
-
-    # side == "lower" and status == STATUS_REJECT
-
-    return (
-        "🟢↩️ رد شد از باند پایین",
-        "احتمال برگشت روند"
-    )
-
-
-def build_message(signal, side, status):
-
-    band_name = (
-        "BB50 EMA"
-        if signal["type"] == "BB50 TOUCH"
-        else "BB100 EMA"
-    )
-
-    title, note = band_headline(
-        side,
-        status
-    )
+def build_alert_message(title, direction, signal_val, upper_val, lower_val, price, time_str):
 
     return f"""
-🚨 XAU/USD ALERT
+🚨 WPRBB SIGNAL ALERT ({SYMBOL})
 
 {title}
-{note}
+🧭 جهت: {direction}
 
-📊 Strategy:
-{signal["type"]}
-
-💰 قیمت:
-{signal["price"]:.3f}
-
-━━━━━━━━━━━━━━
-
-📈 Bollinger Band
-
-{band_name}
-
-📊 BBW20 — سه کندل قبل:
-
--3 : {signal["bbw_old"]:.4f}
--2 : {signal["bbw_mid"]:.4f}
--1 : {signal["bbw_new"]:.4f}
-
-✅ BBW صعودی است
+💰 قیمت کلوز: {price:.2f}
+📈 خط سیگنال: {signal_val:.2f}
+⬆️ باند بالا: {upper_val:.2f}
+⬇️ باند پایین: {lower_val:.2f}
 
 ━━━━━━━━━━━━━━
-
-📐 ADX 14:
-{signal["adx"]:.2f}
-
-DI+:
-{signal["plus_di"]:.2f}
-
-DI-:
-{signal["minus_di"]:.2f}
-
-{signal["di_status"]}
-
-━━━━━━━━━━━━━━
-
-⏱ {signal["time"]}
+⏱ زمان: {time_str}
 """.strip()
 
 
 # =========================================================
-# MAIN
+# نگاشت تغییر وضعیت -> متن پیام
+#
+# کلید: (وضعیت قبلی, وضعیت جدید)
+# =========================================================
+
+TRANSITION_MESSAGES = {
+
+    (STATE_INSIDE, STATE_BELOW_LOWER): (
+        "🔴 برخورد از بالا به باند پایین (ادامه روند نزولی)",
+        "Short 🔻"
+    ),
+
+    (STATE_BELOW_LOWER, STATE_INSIDE): (
+        "🟢 برخورد از پایین به باند پایین (برگشت صعودی)",
+        "Long 🟢"
+    ),
+
+    (STATE_INSIDE, STATE_ABOVE_UPPER): (
+        "🟢 برخورد از پایین به باند بالا (ادامه روند صعودی)",
+        "Long 🚀"
+    ),
+
+    (STATE_ABOVE_UPPER, STATE_INSIDE): (
+        "🔴 برخورد از بالا به باند بالا (برگشت نزولی)",
+        "Short 🔻"
+    ),
+
+    (STATE_BELOW_LOWER, STATE_ABOVE_UPPER): (
+        "🟢 پرش مستقیم از باند پایین به باند بالا",
+        "Long 🚀"
+    ),
+
+    (STATE_ABOVE_UPPER, STATE_BELOW_LOWER): (
+        "🔴 پرش مستقیم از باند بالا به باند پایین",
+        "Short 🔻"
+    ),
+}
+
+
+# =========================================================
+# MAIN LOGIC
 # =========================================================
 
 def main():
 
-    print(
-        "Getting market data..."
-    )
+    print("Getting market data...")
 
     df = get_data()
 
@@ -743,150 +270,100 @@ def main():
 
         return
 
-    print(
-        "Calculating indicators..."
-    )
+    print("Calculating WPR + Bollinger...")
 
-    df = calculate_bb50(df)
-    df = calculate_bb100(df)
-    df = calculate_bbw(df)
-    df = calculate_adx(df)
+    df = calculate_wpr_bb(df)
 
     # -----------------------------------------------------
-    # آخرین کندل (همان کندل درحال شکل‌گیری/زنده)
-    # دیگر یک کندل عقب نمی‌رویم چون می‌خواهیم همان لحظه
-    # آلارم بگیریم، نه بعد از بسته شدن کندل.
+    # آخرین کندل (زنده / درحال شکل گیری)
     # -----------------------------------------------------
 
-    index = len(df) - 1
+    curr = df.iloc[len(df) - 1]
 
-    candle_time_ir = df.iloc[index]["datetime"].strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    time_str = curr["datetime"].strftime("%Y-%m-%d %H:%M:%S")
 
-    print(
-        f"Checking candle: {candle_time_ir} (Iran time, live)"
-    )
+    print(f"Checking candle: {time_str}")
+
+    signal_val = curr["signal_line"]
+    upper_val = curr["bb_upper"]
+    lower_val = curr["bb_lower"]
+
+    # -----------------------------------------------------
+    # اگر داده هنوز کامل نشده (NaN)، این اجرا را رد کن
+    # بدون این‌که state را دستکاری کنیم
+    # -----------------------------------------------------
+
+    if pd.isna(signal_val) or pd.isna(upper_val) or pd.isna(lower_val):
+
+        print("Indicators not ready yet (NaN). Skipping.")
+
+        return
+
+    # -----------------------------------------------------
+    # تعیین وضعیت فعلی
+    # -----------------------------------------------------
+
+    if signal_val > upper_val:
+
+        current_position = STATE_ABOVE_UPPER
+
+    elif signal_val < lower_val:
+
+        current_position = STATE_BELOW_LOWER
+
+    else:
+
+        current_position = STATE_INSIDE
 
     state = load_state()
 
-    band_status = state["band_status"]
-
-    strategies = [
-        (
-            "bb50_upper_status",
-            "bb50_lower_status",
-            "bb50_upper",
-            "bb50_lower",
-            "BB50 TOUCH"
-        ),
-        (
-            "bb100_upper_status",
-            "bb100_lower_status",
-            "bb100_upper",
-            "bb100_lower",
-            "BB100 TOUCH"
-        )
-    ]
-
-    messages_to_send = []
-
-    for (
-        upper_status_key,
-        lower_status_key,
-        upper_col,
-        lower_col,
-        label
-    ) in strategies:
-
-        result = check_band_touch(
-            df,
-            index,
-            upper_col,
-            lower_col,
-            label
-        )
-
-        old_upper_status = band_status[upper_status_key]
-        old_lower_status = band_status[lower_status_key]
-
-        new_upper_status = result["upper_status"]
-        new_lower_status = result["lower_status"]
-
-        # ---------------------------------------------------
-        # آلارم فقط روی تغییر وضعیت، و فقط اگر وضعیت جدید
-        # none نباشد (خروج از باند بی صدا ثبت می شود)
-        # ---------------------------------------------------
-
-        if (
-            new_upper_status != old_upper_status
-            and new_upper_status != STATUS_NONE
-            and result["indicators_ok"]
-        ):
-
-            messages_to_send.append(
-                build_message(
-                    result,
-                    "upper",
-                    new_upper_status
-                )
-            )
-
-        if (
-            new_lower_status != old_lower_status
-            and new_lower_status != STATUS_NONE
-            and result["indicators_ok"]
-        ):
-
-            messages_to_send.append(
-                build_message(
-                    result,
-                    "lower",
-                    new_lower_status
-                )
-            )
-
-        # ---------------------------------------------------
-        # پرچم وضعیت را همیشه به‌روز کن، چه آلارم بفرستیم چه نه
-        # ---------------------------------------------------
-
-        band_status[upper_status_key] = new_upper_status
-        band_status[lower_status_key] = new_lower_status
+    last_position = state.get("last_position", STATE_NONE)
 
     # -----------------------------------------------------
-    # ارسال
+    # آلارم فقط روی تغییر وضعیت واقعی نسبت به اجرای قبلی
+    # (نه هر بار که همان وضعیت تکرار شود، نه بر اساس زمان)
     # -----------------------------------------------------
 
-    if not messages_to_send:
+    if (
+        last_position != STATE_NONE
+        and last_position != current_position
+    ):
+
+        transition_key = (last_position, current_position)
+
+        transition = TRANSITION_MESSAGES.get(transition_key)
+
+        if transition is not None:
+
+            title, direction = transition
+
+            message = build_alert_message(
+                title,
+                direction,
+                signal_val,
+                upper_val,
+                lower_val,
+                curr["close"],
+                time_str
+            )
+
+            print(f"Sending Alert:\n{message}")
+
+            send_telegram(message)
+
+            print("Alert sent.")
+
+    else:
 
         print(
-            "No new signal."
+            f"No transition. Position: {current_position}"
         )
 
-    for message in messages_to_send:
+    state["last_position"] = current_position
 
-        print(
-            message
-        )
+    save_state(state)
 
-        send_telegram(
-            message
-        )
-
-        print(
-            "Alert sent."
-        )
-
-    state["last_candle_time"] = candle_time_ir
-    state["band_status"] = band_status
-
-    save_state(
-        state
-    )
-
-    print(
-        "State saved."
-    )
+    print("Execution completed.")
 
 
 # =========================================================
@@ -899,13 +376,9 @@ if __name__ == "__main__":
 
     except Exception as e:
 
-        print(
-            f"FATAL ERROR: {e}"
-        )
+        print(f"FATAL ERROR: {e}")
 
-        send_error_alert(
-            str(e)
-        )
+        send_error_alert(str(e))
 
         raise
-    
+        
