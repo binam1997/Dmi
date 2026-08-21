@@ -56,6 +56,22 @@ OUTPUT_SIZE = 200
 
 STATE_FILE = "state.json"
 
+# حداقل تعداد کندل لازم برای اینکه همه اندیکاتورها معتبر باشند
+MIN_WARMUP = max(
+    BB100_LENGTH,
+    BBW_LENGTH,
+    ADX_LENGTH
+) + 5
+
+
+# ---------------------------------------------------------
+# وضعیت های ممکن برای هر باند
+# ---------------------------------------------------------
+
+STATUS_NONE = "none"
+STATUS_RIDE = "ride"
+STATUS_REJECT = "reject"
+
 
 # =========================================================
 # GET MARKET DATA
@@ -70,7 +86,7 @@ def get_data():
         "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
-        "timezone": "Asia/Tehran"
+        "timezone": "UTC"
     }
 
     response = requests.get(
@@ -138,7 +154,7 @@ def calculate_bb50(df):
 
     std = df["close"].rolling(
         BB50_LENGTH
-    ).std(ddof=0)
+    ).std(ddof=1)
 
     df["bb50_mid"] = basis
 
@@ -166,7 +182,7 @@ def calculate_bb100(df):
 
     std = df["close"].rolling(
         BB100_LENGTH
-    ).std(ddof=0)
+    ).std(ddof=1)
 
     df["bb100_mid"] = basis
 
@@ -193,7 +209,7 @@ def calculate_bbw(df):
 
     std = df["close"].rolling(
         BBW_LENGTH
-    ).std(ddof=0)
+    ).std(ddof=1)
 
     upper = (
         basis + BBW_STD * std
@@ -302,10 +318,17 @@ def calculate_adx(df):
         / atr
     )
 
-    dx = (
-        100
-        * (plus_di - minus_di).abs()
-        / (plus_di + minus_di)
+    di_sum = plus_di + minus_di
+
+    dx = np.where(
+        di_sum == 0,
+        0,
+        100 * (plus_di - minus_di).abs() / di_sum
+    )
+
+    dx = pd.Series(
+        dx,
+        index=df.index
     )
 
     adx = dx.ewm(
@@ -322,7 +345,31 @@ def calculate_adx(df):
 
 # =========================================================
 # STATE
+#
+# ساختار:
+#
+# {
+#   "last_candle_time": "...",
+#   "band_status": {
+#       "bb50_upper_status": "none" | "ride" | "reject",
+#       "bb50_lower_status": "none" | "ride" | "reject",
+#       "bb100_upper_status": "none" | "ride" | "reject",
+#       "bb100_lower_status": "none" | "ride" | "reject"
+#   }
+# }
+#
+# آلارم فقط وقتی ارسال می شود که وضعیت یک باند
+# نسبت به کندل قبلی عوض شده باشد (نه هر بار که همان
+# وضعیت تکرار شود).
 # =========================================================
+
+DEFAULT_BAND_STATUS = {
+    "bb50_upper_status": STATUS_NONE,
+    "bb50_lower_status": STATUS_NONE,
+    "bb100_upper_status": STATUS_NONE,
+    "bb100_lower_status": STATUS_NONE
+}
+
 
 def load_state():
 
@@ -331,7 +378,10 @@ def load_state():
     ):
 
         return {
-            "last_alert_keys": []
+            "last_candle_time": None,
+            "band_status": dict(
+                DEFAULT_BAND_STATUS
+            )
         }
 
     try:
@@ -344,16 +394,31 @@ def load_state():
 
             state = json.load(f)
 
-        if "last_alert_keys" not in state:
+        if "band_status" not in state:
 
-            state["last_alert_keys"] = []
+            state["band_status"] = dict(
+                DEFAULT_BAND_STATUS
+            )
+
+        for key in DEFAULT_BAND_STATUS:
+
+            if key not in state["band_status"]:
+
+                state["band_status"][key] = STATUS_NONE
+
+        if "last_candle_time" not in state:
+
+            state["last_candle_time"] = None
 
         return state
 
     except Exception:
 
         return {
-            "last_alert_keys": []
+            "last_candle_time": None,
+            "band_status": dict(
+                DEFAULT_BAND_STATUS
+            )
         }
 
 
@@ -398,19 +463,25 @@ def send_telegram(message):
     response.raise_for_status()
 
 
+def send_error_alert(error_text):
+
+    try:
+
+        send_telegram(
+            f"⚠️ ربات XAU/USD خطا داد:\n\n{error_text}"
+        )
+
+    except Exception:
+
+        # اگر ارسال خطا هم شکست خورد، دیگر کاری نمی شود کرد
+        pass
+
+
 # =========================================================
 # BBW TREND
-# =========================================================
 #
-# سه کندل قبل از سیگنال را بررسی می کنیم.
-#
-# مثال:
-#
-# 19 -> 18.5 -> 20
-#
-# چون 20 > 19 است،
-# روند BBW صعودی محسوب می شود.
-#
+# سه کندل قبل از سیگنال را بررسی می کنیم و باید
+# به صورت پیوسته صعودی باشد: old < mid < new
 # =========================================================
 
 def bbw_is_rising(df, index):
@@ -438,445 +509,170 @@ def bbw_is_rising(df, index):
 
         return False
 
-    return bbw_new > bbw_old
+    return (
+        bbw_old < bbw_mid
+        and bbw_mid < bbw_new
+    )
 
 
 # =========================================================
-# STRATEGY 1
-#
-# BB50 TOUCH
-# +
-# BBW20 RISING
+# DI STATUS TEXT
 # =========================================================
 
-def check_bb50_touch(df, index):
-
-    if index < 5:
-        return None
-
-    candle = df.iloc[index]
-
-    # -----------------------------------------------------
-    # برخورد با باند
-    # -----------------------------------------------------
-
-    upper_touch = (
-        candle["high"]
-        >= candle["bb50_upper"]
-    )
-
-    lower_touch = (
-        candle["low"]
-        <= candle["bb50_lower"]
-    )
-
-    if not upper_touch and not lower_touch:
-        return None
-
-    # -----------------------------------------------------
-    # BBW باید صعودی باشد
-    # -----------------------------------------------------
-
-    if not bbw_is_rising(
-        df,
-        index
-    ):
-
-        return None
-
-    # -----------------------------------------------------
-    # ADX / DI
-    # -----------------------------------------------------
-
-    adx = candle["adx"]
-
-    plus_di = candle["plus_di"]
-
-    minus_di = candle["minus_di"]
-
-    if (
-        pd.isna(adx)
-        or pd.isna(plus_di)
-        or pd.isna(minus_di)
-    ):
-
-        return None
+def di_status_text(plus_di, minus_di):
 
     if plus_di > minus_di:
 
-        di_status = (
-            "DI+ بالاتر از DI- است 🟢"
-        )
+        return "DI+ بالاتر از DI- است 🟢"
 
     elif minus_di > plus_di:
 
-        di_status = (
-            "DI- بالاتر از DI+ است 🔴"
-        )
+        return "DI- بالاتر از DI+ است 🔴"
+
+    return "DI+ و DI- برابر هستند ⚪"
+
+
+# =========================================================
+# طبقه بندی برخورد یک باند
+#
+# none    -> اصلا لمس نشده
+# ride    -> لمس شده و بادی کندل هم بیرون از باند کلوز کرده
+#            (احتمال ادامه ی روند، قیمت دارد "سوار" باند می شود)
+# reject  -> فقط فتیله لمس کرده، کلوز داخل باند برگشته
+#            (احتمال برگشت روند)
+# =========================================================
+
+def classify_band(high, low, close, band_value, side):
+
+    if side == "upper":
+
+        touched = high >= band_value
+        closed_beyond = close > band_value
 
     else:
 
-        di_status = (
-            "DI+ و DI- برابر هستند ⚪"
-        )
+        touched = low <= band_value
+        closed_beyond = close < band_value
 
-    # -----------------------------------------------------
-    # نوع برخورد
-    # -----------------------------------------------------
+    if not touched:
+        return STATUS_NONE
 
-    if upper_touch and lower_touch:
+    if closed_beyond:
+        return STATUS_RIDE
 
-        touch = "Upper + Lower"
+    return STATUS_REJECT
 
-        emoji = "⚠️"
 
-    elif upper_touch:
+# =========================================================
+# STRATEGY CHECK (مشترک برای BB50 و BB100)
+# =========================================================
 
-        touch = "Upper Band"
+def check_band_touch(df, index, upper_col, lower_col, label):
 
-        emoji = "🔴"
+    candle = df.iloc[index]
 
-    else:
-
-        touch = "Lower Band"
-
-        emoji = "🟢"
-
-    candle_time = str(
-        candle["datetime"]
+    upper_status = classify_band(
+        candle["high"],
+        candle["low"],
+        candle["close"],
+        candle[upper_col],
+        "upper"
     )
 
-    alert_key = (
-        f"BB50_{candle_time}_{touch}"
+    lower_status = classify_band(
+        candle["high"],
+        candle["low"],
+        candle["close"],
+        candle[lower_col],
+        "lower"
+    )
+
+    adx = candle["adx"]
+    plus_di = candle["plus_di"]
+    minus_di = candle["minus_di"]
+
+    bbw_ok = bbw_is_rising(
+        df,
+        index
+    )
+
+    indicators_ok = (
+        bbw_ok
+        and not pd.isna(adx)
+        and not pd.isna(plus_di)
+        and not pd.isna(minus_di)
     )
 
     return {
-
-        "type": "BB50 TOUCH",
-
-        "alert_key": alert_key,
-
-        "time": candle_time,
-
-        "touch": touch,
-
-        "emoji": emoji,
-
+        "type": label,
+        "upper_status": upper_status,
+        "lower_status": lower_status,
+        "indicators_ok": indicators_ok,
         "price": candle["close"],
-
-        "bbw_old": df.iloc[
-            index - 3
-        ]["bbw20"],
-
-        "bbw_mid": df.iloc[
-            index - 2
-        ]["bbw20"],
-
-        "bbw_new": df.iloc[
-            index - 1
-        ]["bbw20"],
-
+        "time": str(candle["datetime"]),
+        "bbw_old": df.iloc[index - 3]["bbw20"] if index >= 3 else np.nan,
+        "bbw_mid": df.iloc[index - 2]["bbw20"] if index >= 2 else np.nan,
+        "bbw_new": df.iloc[index - 1]["bbw20"] if index >= 1 else np.nan,
         "adx": adx,
-
         "plus_di": plus_di,
-
         "minus_di": minus_di,
-
-        "di_status": di_status
+        "di_status": di_status_text(plus_di, minus_di)
     }
 
 
 # =========================================================
-# STRATEGY 2
-#
-# BB100 TOUCH
-# +
-# BBW20 RISING
-#
-# دقیقاً مشابه Strategy 1
+# متن پیام بر اساس side ("upper"/"lower") و status ("ride"/"reject")
 # =========================================================
 
-def check_bb100_touch(df, index):
+def band_headline(side, status):
 
-    if index < 5:
-        return None
+    if side == "upper" and status == STATUS_RIDE:
 
-    candle = df.iloc[index]
-
-    # -----------------------------------------------------
-    # برخورد با باند
-    # -----------------------------------------------------
-
-    upper_touch = (
-        candle["high"]
-        >= candle["bb100_upper"]
-    )
-
-    lower_touch = (
-        candle["low"]
-        <= candle["bb100_lower"]
-    )
-
-    if not upper_touch and not lower_touch:
-        return None
-
-    # -----------------------------------------------------
-    # BBW باید صعودی باشد
-    # -----------------------------------------------------
-
-    if not bbw_is_rising(
-        df,
-        index
-    ):
-
-        return None
-
-    # -----------------------------------------------------
-    # ADX / DI
-    # -----------------------------------------------------
-
-    adx = candle["adx"]
-
-    plus_di = candle["plus_di"]
-
-    minus_di = candle["minus_di"]
-
-    if (
-        pd.isna(adx)
-        or pd.isna(plus_di)
-        or pd.isna(minus_di)
-    ):
-
-        return None
-
-    if plus_di > minus_di:
-
-        di_status = (
-            "DI+ بالاتر از DI- است 🟢"
+        return (
+            "🟢🚀 سوار باند بالا شد",
+            "احتمال ادامه ی روند صعودی"
         )
 
-    elif minus_di > plus_di:
+    if side == "upper" and status == STATUS_REJECT:
 
-        di_status = (
-            "DI- بالاتر از DI+ است 🔴"
+        return (
+            "🔴↩️ رد شد از باند بالا",
+            "احتمال برگشت روند"
         )
 
-    else:
+    if side == "lower" and status == STATUS_RIDE:
 
-        di_status = (
-            "DI+ و DI- برابر هستند ⚪"
+        return (
+            "🔴🚀 سوار باند پایین شد",
+            "احتمال ادامه ی روند نزولی"
         )
 
-    # -----------------------------------------------------
-    # نوع برخورد
-    # -----------------------------------------------------
+    # side == "lower" and status == STATUS_REJECT
 
-    if upper_touch and lower_touch:
-
-        touch = "Upper + Lower"
-
-        emoji = "⚠️"
-
-    elif upper_touch:
-
-        touch = "Upper Band"
-
-        emoji = "🔴"
-
-    else:
-
-        touch = "Lower Band"
-
-        emoji = "🟢"
-
-    candle_time = str(
-        candle["datetime"]
+    return (
+        "🟢↩️ رد شد از باند پایین",
+        "احتمال برگشت روند"
     )
 
-    alert_key = (
-        f"BB100_{candle_time}_{touch}"
+
+def build_message(signal, side, status):
+
+    band_name = (
+        "BB50 EMA"
+        if signal["type"] == "BB50 TOUCH"
+        else "BB100 EMA"
     )
 
-    return {
-
-        "type": "BB100 TOUCH",
-
-        "alert_key": alert_key,
-
-        "time": candle_time,
-
-        "touch": touch,
-
-        "emoji": emoji,
-
-        "price": candle["close"],
-
-        "bbw_old": df.iloc[
-            index - 3
-        ]["bbw20"],
-
-        "bbw_mid": df.iloc[
-            index - 2
-        ]["bbw20"],
-
-        "bbw_new": df.iloc[
-            index - 1
-        ]["bbw20"],
-
-        "adx": adx,
-
-        "plus_di": plus_di,
-
-        "minus_di": minus_di,
-
-        "di_status": di_status
-    }
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    print(
-        "Getting market data..."
+    title, note = band_headline(
+        side,
+        status
     )
 
-    df = get_data()
-
-    print(
-        "Calculating indicators..."
-    )
-
-    # -----------------------------------------------------
-    # Bollinger 50
-    # -----------------------------------------------------
-
-    df = calculate_bb50(df)
-
-    # -----------------------------------------------------
-    # Bollinger 100
-    # -----------------------------------------------------
-
-    df = calculate_bb100(df)
-
-    # -----------------------------------------------------
-    # BBW20
-    # -----------------------------------------------------
-
-    df = calculate_bbw(df)
-
-    # -----------------------------------------------------
-    # ADX14
-    # -----------------------------------------------------
-
-    df = calculate_adx(df)
-
-    # -----------------------------------------------------
-    # آخرین کندل بسته شده
-    # -----------------------------------------------------
-
-    index = len(df) - 2
-
-    print(
-        f"Checking candle: "
-        f"{df.iloc[index]['datetime']}"
-    )
-
-    # -----------------------------------------------------
-    # Strategy 1
-    # -----------------------------------------------------
-
-    signal_1 = check_bb50_touch(
-        df,
-        index
-    )
-
-    # -----------------------------------------------------
-    # Strategy 2
-    # -----------------------------------------------------
-
-    signal_2 = check_bb100_touch(
-        df,
-        index
-    )
-
-    # -----------------------------------------------------
-    # جمع آلارم ها
-    # -----------------------------------------------------
-
-    signals = []
-
-    if signal_1 is not None:
-
-        signals.append(
-            signal_1
-        )
-
-    if signal_2 is not None:
-
-        signals.append(
-            signal_2
-        )
-
-    # -----------------------------------------------------
-    # هیچ سیگنالی وجود ندارد
-    # -----------------------------------------------------
-
-    if not signals:
-
-        print(
-            "No valid signal."
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # State
-    # -----------------------------------------------------
-
-    state = load_state()
-
-    sent_keys = set(
-        state.get(
-            "last_alert_keys",
-            []
-        )
-    )
-
-    # =====================================================
-    # SEND SIGNALS
-    # =====================================================
-
-    for signal in signals:
-
-        alert_key = signal[
-            "alert_key"
-        ]
-
-        # -------------------------------------------------
-        # جلوگیری از اسپم
-        # -------------------------------------------------
-
-        if alert_key in sent_keys:
-
-            print(
-                f"Already sent: "
-                f"{alert_key}"
-            )
-
-            continue
-
-        # =================================================
-        # MESSAGE
-        # =================================================
-
-        message = f"""
+    return f"""
 🚨 XAU/USD ALERT
 
-{signal["emoji"]} برخورد قیمت با:
-{signal["touch"]}
+{title}
+{note}
 
 📊 Strategy:
 {signal["type"]}
@@ -888,7 +684,7 @@ def main():
 
 📈 Bollinger Band
 
-{"BB50 EMA" if signal["type"] == "BB50 TOUCH" else "BB100 EMA"}
+{band_name}
 
 📊 BBW20 — سه کندل قبل:
 
@@ -916,40 +712,175 @@ DI-:
 ⏱ {signal["time"]}
 """.strip()
 
-        # -------------------------------------------------
-        # چاپ در Console
-        # -------------------------------------------------
 
-        print(message)
+# =========================================================
+# MAIN
+# =========================================================
 
-        # -------------------------------------------------
-        # ارسال تلگرام
-        # -------------------------------------------------
+def main():
+
+    print(
+        "Getting market data..."
+    )
+
+    df = get_data()
+
+    if len(df) < MIN_WARMUP:
+
+        print(
+            f"Not enough candles yet "
+            f"({len(df)} < {MIN_WARMUP})."
+        )
+
+        return
+
+    print(
+        "Calculating indicators..."
+    )
+
+    df = calculate_bb50(df)
+    df = calculate_bb100(df)
+    df = calculate_bbw(df)
+    df = calculate_adx(df)
+
+    # -----------------------------------------------------
+    # آخرین کندل بسته شده
+    # (فرض: آخرین ردیف = کندل درحال شکل گیری)
+    # -----------------------------------------------------
+
+    index = len(df) - 2
+
+    candle_time = str(
+        df.iloc[index]["datetime"]
+    )
+
+    print(
+        f"Checking candle: {candle_time}"
+    )
+
+    state = load_state()
+
+    # -----------------------------------------------------
+    # اگر این کندل قبلاً پردازش شده، دوباره پردازش نکن
+    # -----------------------------------------------------
+
+    if state["last_candle_time"] == candle_time:
+
+        print(
+            "This candle was already processed. Skipping."
+        )
+
+        return
+
+    band_status = state["band_status"]
+
+    strategies = [
+        (
+            "bb50_upper_status",
+            "bb50_lower_status",
+            "bb50_upper",
+            "bb50_lower",
+            "BB50 TOUCH"
+        ),
+        (
+            "bb100_upper_status",
+            "bb100_lower_status",
+            "bb100_upper",
+            "bb100_lower",
+            "BB100 TOUCH"
+        )
+    ]
+
+    messages_to_send = []
+
+    for (
+        upper_status_key,
+        lower_status_key,
+        upper_col,
+        lower_col,
+        label
+    ) in strategies:
+
+        result = check_band_touch(
+            df,
+            index,
+            upper_col,
+            lower_col,
+            label
+        )
+
+        old_upper_status = band_status[upper_status_key]
+        old_lower_status = band_status[lower_status_key]
+
+        new_upper_status = result["upper_status"]
+        new_lower_status = result["lower_status"]
+
+        # ---------------------------------------------------
+        # آلارم فقط روی تغییر وضعیت، و فقط اگر وضعیت جدید
+        # none نباشد (خروج از باند بی صدا ثبت می شود)
+        # ---------------------------------------------------
+
+        if (
+            new_upper_status != old_upper_status
+            and new_upper_status != STATUS_NONE
+            and result["indicators_ok"]
+        ):
+
+            messages_to_send.append(
+                build_message(
+                    result,
+                    "upper",
+                    new_upper_status
+                )
+            )
+
+        if (
+            new_lower_status != old_lower_status
+            and new_lower_status != STATUS_NONE
+            and result["indicators_ok"]
+        ):
+
+            messages_to_send.append(
+                build_message(
+                    result,
+                    "lower",
+                    new_lower_status
+                )
+            )
+
+        # ---------------------------------------------------
+        # پرچم وضعیت را همیشه به‌روز کن، چه آلارم بفرستیم چه نه
+        # ---------------------------------------------------
+
+        band_status[upper_status_key] = new_upper_status
+        band_status[lower_status_key] = new_lower_status
+
+    # -----------------------------------------------------
+    # ارسال
+    # -----------------------------------------------------
+
+    if not messages_to_send:
+
+        print(
+            "No new signal."
+        )
+
+    for message in messages_to_send:
+
+        print(
+            message
+        )
 
         send_telegram(
             message
         )
 
-        # -------------------------------------------------
-        # ذخیره Alert Key
-        # -------------------------------------------------
-
-        sent_keys.add(
-            alert_key
-        )
-
         print(
-            f"Alert sent: "
-            f"{alert_key}"
+            "Alert sent."
         )
 
-    # -----------------------------------------------------
-    # نگهداری آخرین 100 آلارم
-    # -----------------------------------------------------
-
-    state["last_alert_keys"] = list(
-        sent_keys
-    )[-100:]
+    state["last_candle_time"] = candle_time
+    state["band_status"] = band_status
 
     save_state(
         state
@@ -963,4 +894,19 @@ DI-:
 # =========================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except Exception as e:
+
+        print(
+            f"FATAL ERROR: {e}"
+        )
+
+        send_error_alert(
+            str(e)
+        )
+
+        raise
