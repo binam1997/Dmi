@@ -106,10 +106,10 @@
     "BB50_2026-08-21 10:50:00_Upper Band"
   ],
   "band_status": {
-    "bb50_upper_status": "none",
+    "bb50_upper_status": "reject",
     "bb50_lower_status": "none",
     "bb100_upper_status": "none",
     "bb100_lower_status": "none"
   },
-  "last_candle_time": "2026-08-21 14:02:00"
+  "last_candle_time": "2026-08-21 14:05:00"
 }
