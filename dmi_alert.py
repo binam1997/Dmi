@@ -3,6 +3,10 @@ import json
 import requests
 import pandas as pd
 import numpy as np
+from zoneinfo import ZoneInfo
+
+
+IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 
 # =========================================================
@@ -120,6 +124,8 @@ def get_data():
 
     df["datetime"] = pd.to_datetime(
         df["datetime"]
+    ).dt.tz_localize(
+        IRAN_TZ
     )
 
     df = df.sort_values(
@@ -480,8 +486,14 @@ def send_error_alert(error_text):
 # =========================================================
 # BBW TREND
 #
-# سه کندل قبل از سیگنال را بررسی می کنیم و باید
-# به صورت پیوسته صعودی باشد: old < mid < new
+# سه کندل قبل از سیگنال را بررسی می کنیم.
+# لازم نیست هر قدم تک تک صعودی باشد (یک دیپ کوچک در وسط
+# اشکالی ندارد)، فقط روند میانگینِ این سه کندل باید رو به
+# بالا باشد.
+#
+# روی سه نقطه ی هم فاصله، "میانگین صعودی" از نظر ریاضی
+# معادل مقایسه ی فقط قدیمی ترین و جدیدترین مقدار است
+# (مقدار میانی در میانگین گیری حذف می شود).
 # =========================================================
 
 def bbw_is_rising(df, index):
@@ -509,10 +521,7 @@ def bbw_is_rising(df, index):
 
         return False
 
-    return (
-        bbw_old < bbw_mid
-        and bbw_mid < bbw_new
-    )
+    return bbw_new > bbw_old
 
 
 # =========================================================
@@ -609,7 +618,7 @@ def check_band_touch(df, index, upper_col, lower_col, label):
         "lower_status": lower_status,
         "indicators_ok": indicators_ok,
         "price": candle["close"],
-        "time": str(candle["datetime"]),
+        "time": candle["datetime"].strftime("%Y-%m-%d %H:%M:%S"),
         "bbw_old": df.iloc[index - 3]["bbw20"] if index >= 3 else np.nan,
         "bbw_mid": df.iloc[index - 2]["bbw20"] if index >= 2 else np.nan,
         "bbw_new": df.iloc[index - 1]["bbw20"] if index >= 1 else np.nan,
@@ -744,33 +753,22 @@ def main():
     df = calculate_adx(df)
 
     # -----------------------------------------------------
-    # آخرین کندل بسته شده
-    # (فرض: آخرین ردیف = کندل درحال شکل گیری)
+    # آخرین کندل (همان کندل درحال شکل‌گیری/زنده)
+    # دیگر یک کندل عقب نمی‌رویم چون می‌خواهیم همان لحظه
+    # آلارم بگیریم، نه بعد از بسته شدن کندل.
     # -----------------------------------------------------
 
-    index = len(df) - 2
+    index = len(df) - 1
 
-    candle_time = str(
-        df.iloc[index]["datetime"]
+    candle_time_ir = df.iloc[index]["datetime"].strftime(
+        "%Y-%m-%d %H:%M:%S"
     )
 
     print(
-        f"Checking candle: {candle_time}"
+        f"Checking candle: {candle_time_ir} (Iran time, live)"
     )
 
     state = load_state()
-
-    # -----------------------------------------------------
-    # اگر این کندل قبلاً پردازش شده، دوباره پردازش نکن
-    # -----------------------------------------------------
-
-    if state["last_candle_time"] == candle_time:
-
-        print(
-            "This candle was already processed. Skipping."
-        )
-
-        return
 
     band_status = state["band_status"]
 
@@ -879,7 +877,7 @@ def main():
             "Alert sent."
         )
 
-    state["last_candle_time"] = candle_time
+    state["last_candle_time"] = candle_time_ir
     state["band_status"] = band_status
 
     save_state(
@@ -910,3 +908,4 @@ if __name__ == "__main__":
         )
 
         raise
+    
