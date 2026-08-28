@@ -10,7 +10,7 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 
 # =========================================================
-# SETTINGS
+# SETTINGS (طبق تنظیمات WPRBB [Loxx])
 # =========================================================
 
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
@@ -18,71 +18,44 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
-INTERVAL = "1min"
+INTERVAL = "5min"
 
-# تنظیمات WPR و Bollinger Bands
 WPR_PERIOD = 200
-WPR_MA_PERIOD = 3
+WPR_MA_PERIOD = 10
 WPR_MA_TYPE = "EMA"
 
-BB_PERIOD = 50
-BB_STD = 1.0
+BB_PERIOD = 100
+BB_MULT = 1.0
 BB_MA_TYPE = "EMA"
 
-OUTPUT_SIZE = 300
+FLAT_THRESHOLD = 0.5
+
+OUTPUT_SIZE = 400
 
 STATE_FILE = "state.json"
 
-# حداقل تعداد کندل لازم تا WPR + Bollinger روی آن هر دو معتبر باشند
-MIN_WARMUP = WPR_PERIOD + BB_PERIOD + 5
+# حداقل تعداد کندل لازم تا WPR + BB روی آن هر دو معتبر باشند
+MIN_WARMUP = WPR_PERIOD + BB_PERIOD + 10
+
+
+# ---------------------------------------------------------
+# رنگ خط WPR
+# ---------------------------------------------------------
+
+COLOR_GREEN = "green"
+COLOR_RED = "red"
+COLOR_YELLOW = "yellow"
+
+# ---------------------------------------------------------
+# وضعیت "آماده‌باش" هر سناریو
+# ---------------------------------------------------------
+
+ARM_NONE = "NONE"
+ARM_ARMED = "ARMED"
 
 
 # =========================================================
-# STATE & CONSTANTS
-# =========================================================
-
-STATE_NONE = "NONE"
-STATE_ABOVE_UPPER = "ABOVE_UPPER"
-STATE_INSIDE = "INSIDE"
-STATE_BELOW_LOWER = "BELOW_LOWER"
-
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-
-        return {
-            "last_position": STATE_NONE
-        }
-
-    try:
-
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-
-            state = json.load(f)
-
-        if "last_position" not in state:
-
-            state["last_position"] = STATE_NONE
-
-        return state
-
-    except Exception:
-
-        return {
-            "last_position": STATE_NONE
-        }
-
-
-def save_state(state):
-
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-# =========================================================
-# DATA & INDICATORS
+# DATA
 # =========================================================
 
 def get_data():
@@ -142,28 +115,85 @@ def get_ma(series, length, ma_type):
         return series.rolling(length).mean()
 
 
-def calculate_wpr_bb(df):
+# =========================================================
+# WPRBB [Loxx] — دقیقاً طبق کد Pine
+# =========================================================
 
-    # ۱. محاسبه Williams %R پایه
+def calculate_wprbb(df):
+
     highest_high = df["high"].rolling(WPR_PERIOD).max()
     lowest_low = df["low"].rolling(WPR_PERIOD).min()
 
     wpr_raw = 100 * (df["close"] - highest_high) / (highest_high - lowest_low)
 
-    # ۲. نرمالسازی بازه به [-100, 100] و اعمال MA
-    wpr_scaled = (wpr_raw + 50.0) * 2.0
+    out_raw = (wpr_raw + 50.0) * 2.0
 
-    df["signal_line"] = get_ma(wpr_scaled, WPR_MA_PERIOD, WPR_MA_TYPE)
+    df["out"] = get_ma(out_raw, WPR_MA_PERIOD, WPR_MA_TYPE)
 
-    # ۳. محاسبه باند بولینگر روی خط سیگنال
-    basis = get_ma(df["signal_line"], BB_PERIOD, BB_MA_TYPE)
+    basis = get_ma(df["out"], BB_PERIOD, BB_MA_TYPE)
 
-    dev = BB_STD * df["signal_line"].rolling(BB_PERIOD).std(ddof=1)
+    # ta.stdev در Pine جمعیتی است (ddof=0)
+    dev = BB_MULT * df["out"].rolling(BB_PERIOD).std(ddof=0)
 
-    df["bb_upper"] = basis + dev
-    df["bb_lower"] = basis - dev
+    df["upper"] = basis + dev
+    df["lower"] = basis - dev
+
+    out_diff = df["out"] - df["out"].shift(1)
+
+    df["color"] = np.where(
+        out_diff > FLAT_THRESHOLD,
+        COLOR_GREEN,
+        np.where(
+            out_diff < -FLAT_THRESHOLD,
+            COLOR_RED,
+            COLOR_YELLOW
+        )
+    )
 
     return df
+
+
+# =========================================================
+# STATE
+# =========================================================
+
+DEFAULT_STATE = {
+    "bearish_arm": ARM_NONE,
+    "bullish_arm": ARM_NONE,
+    "last_candle_time": None
+}
+
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+
+        return dict(DEFAULT_STATE)
+
+    try:
+
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+
+            state = json.load(f)
+
+        for key in DEFAULT_STATE:
+
+            if key not in state:
+
+                state[key] = DEFAULT_STATE[key]
+
+        return state
+
+    except Exception:
+
+        return dict(DEFAULT_STATE)
+
+
+def save_state(state):
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 # =========================================================
@@ -184,25 +214,24 @@ def send_error_alert(error_text):
     try:
 
         send_telegram(
-            f"⚠️ ربات WPRBB خطا داد:\n\n{error_text}"
+            f"⚠️ ربات WPRBB Reversal خطا داد:\n\n{error_text}"
         )
 
     except Exception:
 
-        # اگر ارسال خطا هم شکست خورد، دیگر کاری نمی شود کرد
         pass
 
 
-def build_alert_message(title, direction, signal_val, upper_val, lower_val, price, time_str):
+def build_message(title, direction, price, out_val, upper_val, lower_val, time_str):
 
     return f"""
-🚨 WPRBB SIGNAL ALERT ({SYMBOL})
+🚨 WPRBB REVERSAL ALERT ({SYMBOL})
 
 {title}
 🧭 جهت: {direction}
 
 💰 قیمت کلوز: {price:.2f}
-📈 خط سیگنال: {signal_val:.2f}
+📈 خط WPR: {out_val:.2f}
 ⬆️ باند بالا: {upper_val:.2f}
 ⬇️ باند پایین: {lower_val:.2f}
 
@@ -212,47 +241,7 @@ def build_alert_message(title, direction, signal_val, upper_val, lower_val, pric
 
 
 # =========================================================
-# نگاشت تغییر وضعیت -> متن پیام
-#
-# کلید: (وضعیت قبلی, وضعیت جدید)
-# =========================================================
-
-TRANSITION_MESSAGES = {
-
-    (STATE_INSIDE, STATE_BELOW_LOWER): (
-        "🔴 برخورد از بالا به باند پایین (ادامه روند نزولی)",
-        "Short 🔻"
-    ),
-
-    (STATE_BELOW_LOWER, STATE_INSIDE): (
-        "🟢 برخورد از پایین به باند پایین (برگشت صعودی)",
-        "Long 🟢"
-    ),
-
-    (STATE_INSIDE, STATE_ABOVE_UPPER): (
-        "🟢 برخورد از پایین به باند بالا (ادامه روند صعودی)",
-        "Long 🚀"
-    ),
-
-    (STATE_ABOVE_UPPER, STATE_INSIDE): (
-        "🔴 برخورد از بالا به باند بالا (برگشت نزولی)",
-        "Short 🔻"
-    ),
-
-    (STATE_BELOW_LOWER, STATE_ABOVE_UPPER): (
-        "🟢 پرش مستقیم از باند پایین به باند بالا",
-        "Long 🚀"
-    ),
-
-    (STATE_ABOVE_UPPER, STATE_BELOW_LOWER): (
-        "🔴 پرش مستقیم از باند بالا به باند پایین",
-        "Short 🔻"
-    ),
-}
-
-
-# =========================================================
-# MAIN LOGIC
+# MAIN
 # =========================================================
 
 def main():
@@ -270,80 +259,64 @@ def main():
 
         return
 
-    print("Calculating WPR + Bollinger...")
+    print("Calculating WPRBB...")
 
-    df = calculate_wpr_bb(df)
+    df = calculate_wprbb(df)
 
     # -----------------------------------------------------
-    # آخرین کندل (زنده / درحال شکل گیری)
+    # آخرین کندل (زنده / درحال شکل‌گیری) — طبق درخواست شما
+    # هر بار اجرا، همین کندل با آخرین قیمت لحظه‌ای چک می‌شود
     # -----------------------------------------------------
 
     curr = df.iloc[len(df) - 1]
 
     time_str = curr["datetime"].strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"Checking candle: {time_str}")
+    state = load_state()
 
-    signal_val = curr["signal_line"]
-    upper_val = curr["bb_upper"]
-    lower_val = curr["bb_lower"]
+    print(f"Checking candle: {time_str} (live)")
 
-    # -----------------------------------------------------
-    # اگر داده هنوز کامل نشده (NaN)، این اجرا را رد کن
-    # بدون این‌که state را دستکاری کنیم
-    # -----------------------------------------------------
+    out_val = curr["out"]
+    upper_val = curr["upper"]
+    lower_val = curr["lower"]
+    color = curr["color"]
 
-    if pd.isna(signal_val) or pd.isna(upper_val) or pd.isna(lower_val):
+    if pd.isna(out_val) or pd.isna(upper_val) or pd.isna(lower_val):
 
         print("Indicators not ready yet (NaN). Skipping.")
 
         return
 
-    # -----------------------------------------------------
-    # تعیین وضعیت فعلی
-    # -----------------------------------------------------
+    above_upper = out_val > upper_val
+    below_lower = out_val < lower_val
 
-    if signal_val > upper_val:
-
-        current_position = STATE_ABOVE_UPPER
-
-    elif signal_val < lower_val:
-
-        current_position = STATE_BELOW_LOWER
-
-    else:
-
-        current_position = STATE_INSIDE
-
-    state = load_state()
-
-    last_position = state.get("last_position", STATE_NONE)
+    bearish_arm = state["bearish_arm"]
+    bullish_arm = state["bullish_arm"]
 
     # -----------------------------------------------------
-    # آلارم فقط روی تغییر وضعیت واقعی نسبت به اجرای قبلی
-    # (نه هر بار که همان وضعیت تکرار شود، نه بر اساس زمان)
+    # سناریوی نزولی: عبور از باند بالا + رنگ سبز -> آماده‌باش
+    # بعدش هر تغییر رنگ (به زرد یا قرمز) -> آلارم
     # -----------------------------------------------------
 
-    if (
-        last_position != STATE_NONE
-        and last_position != current_position
-    ):
+    if bearish_arm == ARM_NONE:
 
-        transition_key = (last_position, current_position)
+        if above_upper and color == COLOR_GREEN:
 
-        transition = TRANSITION_MESSAGES.get(transition_key)
+            bearish_arm = ARM_ARMED
 
-        if transition is not None:
+            print("Bearish scenario armed (above upper + green).")
 
-            title, direction = transition
+    elif bearish_arm == ARM_ARMED:
 
-            message = build_alert_message(
-                title,
-                direction,
-                signal_val,
+        if color != COLOR_GREEN:
+
+            message = build_message(
+                "🔴 برگشت نزولی — WPR از سبز خارج شد",
+                "Short 🔻",
+                curr["close"],
+                out_val,
                 upper_val,
                 lower_val,
-                curr["close"],
                 time_str
             )
 
@@ -351,15 +324,44 @@ def main():
 
             send_telegram(message)
 
-            print("Alert sent.")
+            bearish_arm = ARM_NONE
 
-    else:
+    # -----------------------------------------------------
+    # سناریوی صعودی: عبور از باند پایین + رنگ قرمز -> آماده‌باش
+    # بعدش هر تغییر رنگ (به زرد یا سبز) -> آلارم
+    # -----------------------------------------------------
 
-        print(
-            f"No transition. Position: {current_position}"
-        )
+    if bullish_arm == ARM_NONE:
 
-    state["last_position"] = current_position
+        if below_lower and color == COLOR_RED:
+
+            bullish_arm = ARM_ARMED
+
+            print("Bullish scenario armed (below lower + red).")
+
+    elif bullish_arm == ARM_ARMED:
+
+        if color != COLOR_RED:
+
+            message = build_message(
+                "🟢 برگشت صعودی — WPR از قرمز خارج شد",
+                "Long 🚀",
+                curr["close"],
+                out_val,
+                upper_val,
+                lower_val,
+                time_str
+            )
+
+            print(f"Sending Alert:\n{message}")
+
+            send_telegram(message)
+
+            bullish_arm = ARM_NONE
+
+    state["bearish_arm"] = bearish_arm
+    state["bullish_arm"] = bullish_arm
+    state["last_candle_time"] = time_str
 
     save_state(state)
 
