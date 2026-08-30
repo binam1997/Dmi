@@ -111,8 +111,8 @@
     "bb100_upper_status": "none",
     "bb100_lower_status": "none"
   },
-  "last_candle_time": "2026-08-30 07:10:00",
+  "last_candle_time": "2026-08-30 07:15:00",
   "last_position": "INSIDE",
-  "bearish_arm": "NONE",
-  "bullish_arm": "ARMED"
+  "bearish_arm": "ARMED",
+  "bullish_arm": "NONE"
 }
