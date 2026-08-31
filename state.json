@@ -113,6 +113,6 @@
   },
   "last_candle_time": "2026-08-31 15:10:00",
   "last_position": "INSIDE",
-  "bearish_arm": "ARMED",
+  "bearish_arm": "NONE",
   "bullish_arm": "NONE"
 }
