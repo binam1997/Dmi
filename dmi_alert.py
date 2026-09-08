@@ -19,11 +19,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 
-BB_PERIOD = 30
+BB_PERIOD = 100
 BB_MULT = 2.0
-BB_MA_TYPE = "SMA"
+BB_MA_TYPE = "EMA"
 
-OUTPUT_SIZE = 200
+OUTPUT_SIZE = 300
 
 MIN_WARMUP = BB_PERIOD + 10
 
@@ -140,7 +140,7 @@ def main():
         print(f"Not enough candles yet ({len(df)} < {MIN_WARMUP}).")
         return
 
-    print("Calculating Bollinger Bands (30)...")
+    print(f"Calculating Bollinger Bands ({BB_PERIOD})...")
     df = calculate_bb(df)
 
     curr = df.iloc[-1]
@@ -189,3 +189,4 @@ if __name__ == "__main__":
         print(f"FATAL ERROR: {e}")
         send_error_alert(str(e))
         raise
+        
