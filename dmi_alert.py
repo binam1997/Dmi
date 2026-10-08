@@ -1,7 +1,9 @@
+import json
 import os
-import requests
-import pandas as pd
+
 import numpy as np
+import pandas as pd
+import requests
 from zoneinfo import ZoneInfo
 
 
@@ -18,14 +20,76 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
+BAR_MINUTES = 5
 
-BB_PERIOD = 100
-BB_MULT = 2.0
-BB_MA_TYPE = "EMA"
+OUTPUT_SIZE = 1000
+WARMUP_BARS = 300
+MIN_CANDLES = WARMUP_BARS + 50
 
-OUTPUT_SIZE = 300
+# signals older than this many closed candles are ignored (protects from late runs)
+MAX_AGE_BARS = 3
 
-MIN_WARMUP = BB_PERIOD + 10
+STATE_FILE = "state.json"
+ERROR_ALERT_MINUTES = 60
+
+# signal logic
+WINDOW = 10
+RE_ENTRY = True
+
+# MACD-V (MACD Dive LTF)
+M_FAST = 30
+M_SLOW = 100
+M_SIG = 20
+M_ATR = 100
+
+# WPRBB (Loxx)
+W_LEN = 30
+W_SM = 20
+BB_LEN = 100
+W_HL = True
+
+# stop / take profit
+STOP_MODE = "Swing"  # "Swing" or "ATR"
+SWING_LEN = 10
+ATR_LEN = 14
+ATR_BUF = 0.3
+ATR_MULT = 2.0
+RR = 1.5
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def safe_text(text):
+
+    text = str(text)
+
+    for secret in (TWELVEDATA_API_KEY, TELEGRAM_BOT_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+
+    return text
+
+
+def load_state():
+
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    return {}
+
+
+def save_state(state):
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
 
 
 # =========================================================
@@ -58,36 +122,187 @@ def get_data():
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(IRAN_TZ)
+    df = df.dropna(subset=["open", "high", "low", "close"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
+    # keep only fully closed candles (datetime = candle open time)
+    now = pd.Timestamp.now(tz=IRAN_TZ)
+    closed = (df["datetime"] + pd.Timedelta(minutes=BAR_MINUTES)) <= now
+    df = df[closed].reset_index(drop=True)
+
+    return df
+
+
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def ema(series, length):
+
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def rma(series, length):
+
+    return series.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def calc_atr(df, length):
+
+    prev_close = df["close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return rma(tr, length)
+
+
+def calculate_indicators(df):
+
+    # MACD-V
+    df["macdv"] = (ema(df["close"], M_FAST) - ema(df["close"], M_SLOW)) / calc_atr(df, M_ATR)
+    df["msig"] = ema(df["macdv"], M_SIG)
+
+    # WPRBB
+    hi = df["high"] if W_HL else df["close"]
+    lo = df["low"] if W_HL else df["close"]
+    highest = hi.rolling(W_LEN).max()
+    lowest = lo.rolling(W_LEN).min()
+    raw = (df["close"] - lowest) / (highest - lowest) * 200 - 100
+    df["wpr"] = ema(raw, W_SM)
+    df["wbas"] = ema(df["wpr"], BB_LEN)
+
+    # stop helpers
+    df["atr_s"] = calc_atr(df, ATR_LEN)
+    df["swing_hi"] = df["high"].rolling(SWING_LEN).max()
+    df["swing_lo"] = df["low"].rolling(SWING_LEN).min()
+
     return df
 
 
-def get_ma(series, length, ma_type):
+# =========================================================
+# SIGNAL LOGIC
+# =========================================================
 
-    if ma_type == "EMA":
-        return series.ewm(span=length, adjust=False).mean()
-    elif ma_type == "WMA":
-        weights = np.arange(1, length + 1)
-        return series.rolling(length).apply(
-            lambda x: np.dot(x, weights) / weights.sum(), raw=True
-        )
-    elif ma_type == "RMA":
-        return series.ewm(alpha=1 / length, adjust=False).mean()
-    else:  # SMA
-        return series.rolling(length).mean()
+def run_logic(df):
 
+    t = df["datetime"].tolist()
+    c = df["close"].to_numpy()
+    h = df["high"].to_numpy()
+    l = df["low"].to_numpy()
+    mv = df["macdv"].to_numpy()
+    ms = df["msig"].to_numpy()
+    wp = df["wpr"].to_numpy()
+    wb = df["wbas"].to_numpy()
+    a = df["atr_s"].to_numpy()
+    sh = df["swing_hi"].to_numpy()
+    sl = df["swing_lo"].to_numpy()
 
-def calculate_bb(df):
+    signals = []
+    last_dir = 0
+    status = "-"
+    stop_lv = None
+    tp_lv = None
+    lm_up = None
+    lm_dn = None
+    lw_up = None
+    lw_dn = None
 
-    basis = get_ma(df["close"], BB_PERIOD, BB_MA_TYPE)
-    dev = BB_MULT * df["close"].rolling(BB_PERIOD).std(ddof=0)
+    for i in range(1, len(df)):
 
-    df["basis"] = basis
-    df["upper"] = basis + dev
-    df["lower"] = basis - dev
+        if i < WARMUP_BARS:
+            continue
 
-    return df
+        m_up = bool(mv[i] > ms[i] and mv[i - 1] <= ms[i - 1])
+        m_dn = bool(mv[i] < ms[i] and mv[i - 1] >= ms[i - 1])
+        w_up = bool(wp[i] > wb[i] and wp[i - 1] <= wb[i - 1])
+        w_dn = bool(wp[i] < wb[i] and wp[i - 1] >= wb[i - 1])
+
+        if m_up:
+            lm_up = i
+        if m_dn:
+            lm_dn = i
+        if w_up:
+            lw_up = i
+        if w_dn:
+            lw_dn = i
+
+        # stop / take profit hit (levels from the previous bar)
+        hit_stop = False
+        hit_tp = False
+
+        if stop_lv is not None:
+            if last_dir == 1:
+                hit_stop = bool(l[i] <= stop_lv)
+                hit_tp = bool(h[i] >= tp_lv)
+            elif last_dir == -1:
+                hit_stop = bool(h[i] >= stop_lv)
+                hit_tp = bool(l[i] <= tp_lv)
+
+        def within(last):
+            return last is not None and (i - last) <= WINDOW
+
+        buy_ev = (m_up and wp[i] > wb[i] and within(lw_up)) or (w_up and mv[i] > ms[i] and within(lm_up))
+        sell_ev = (m_dn and wp[i] < wb[i] and within(lw_dn)) or (w_dn and mv[i] < ms[i] and within(lm_dn))
+
+        free = RE_ENTRY and status != "OPEN"
+        buy_sig = buy_ev and (last_dir != 1 or free)
+        sell_sig = sell_ev and (last_dir != -1 or free)
+
+        if buy_sig and sell_sig:
+            continue
+
+        if buy_sig or sell_sig:
+
+            direction = 1 if buy_sig else -1
+
+            if STOP_MODE == "Swing":
+                if direction == 1:
+                    stop = sl[i] - ATR_BUF * a[i]
+                else:
+                    stop = sh[i] + ATR_BUF * a[i]
+            else:
+                if direction == 1:
+                    stop = c[i] - ATR_MULT * a[i]
+                else:
+                    stop = c[i] + ATR_MULT * a[i]
+
+            if direction == 1:
+                tp = c[i] + RR * (c[i] - stop)
+            else:
+                tp = c[i] - RR * (stop - c[i])
+
+            stop_lv = float(stop)
+            tp_lv = float(tp)
+            last_dir = direction
+            status = "OPEN"
+
+            signals.append({
+                "i": i,
+                "time": t[i],
+                "dir": direction,
+                "entry": float(c[i]),
+                "stop": stop_lv,
+                "tp": tp_lv,
+                "macdv": float(mv[i]),
+                "msig": float(ms[i]),
+                "wpr": float(wp[i]),
+                "wbas": float(wb[i]),
+            })
+
+        elif hit_stop or hit_tp:
+
+            stop_lv = None
+            tp_lv = None
+            status = "STOPPED" if hit_stop else "TP HIT"
+
+    return signals
 
 
 # =========================================================
@@ -103,27 +318,51 @@ def send_telegram(message):
 
 def send_error_alert(error_text):
 
+    # at most one error alert per ERROR_ALERT_MINUTES (the bot may run every few minutes)
     try:
-        send_telegram(f"⚠️ ربات BB Middle Touch خطا داد:\n\n{error_text}")
+        state = load_state()
+        now = pd.Timestamp.now(tz=IRAN_TZ)
+
+        last = state.get("last_error_time")
+        if last:
+            elapsed = (now - pd.Timestamp(last)).total_seconds()
+            if elapsed < ERROR_ALERT_MINUTES * 60:
+                return
+
+        send_telegram(f"⚠️ ربات سیگنال MACD-V + WPRBB خطا داد:\n\n{error_text}")
+
+        state["last_error_time"] = now.isoformat()
+        save_state(state)
     except Exception:
         pass
 
 
-def build_message(price, basis_val, upper_val, lower_val, high_val, low_val, time_str):
+def build_message(s, last_idx, last_close):
+
+    is_buy = s["dir"] == 1
+    side = "BUY" if is_buy else "SELL"
+    icon = "🟢" if is_buy else "🔴"
+
+    risk = abs(s["entry"] - s["stop"])
+    close_time = (s["time"] + pd.Timedelta(minutes=BAR_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+
+    age = last_idx - s["i"]
+    late_line = ""
+    if age >= 1:
+        late_line = f"\n⏱ این سیگنال {age} کندل پیش صادر شده | قیمت فعلی: {last_close:.2f}"
 
     return f"""
-🚨 برخورد قیمت با باند وسط بولینجر ({SYMBOL})
+{icon} سیگنال {side} ({SYMBOL} - ۵ دقیقه)
 
-💰 قیمت کلوز: {price:.2f}
-📈 های کندل: {high_val:.2f}
-📉 لو کندل: {low_val:.2f}
+💰 ورود (کلوز کندل): {s['entry']:.2f}
+🛑 استاپ: {s['stop']:.2f} (ریسک {risk:.2f})
+🎯 حد سود: {s['tp']:.2f} ({RR}R)
 
-📊 باند وسط: {basis_val:.2f}
-⬆️ باند بالا: {upper_val:.2f}
-⬇️ باند پایین: {lower_val:.2f}
+📊 MACD-V: {s['macdv']:.3f} | سیگنال: {s['msig']:.3f}
+📉 WPR: {s['wpr']:.1f} | میدلاین: {s['wbas']:.1f}
 
 ━━━━━━━━━━━━━━
-⏱ زمان: {time_str}
+⏱ زمان بسته شدن کندل: {close_time}{late_line}
 """.strip()
 
 
@@ -133,48 +372,59 @@ def build_message(price, basis_val, upper_val, lower_val, high_val, low_val, tim
 
 def main():
 
+    if os.environ.get("TEST_MESSAGE") == "1":
+        send_telegram("✅ ربات سیگنال MACD-V + WPRBB فعال است")
+        print("Test message sent.")
+        return
+
     print("Getting market data...")
     df = get_data()
 
-    if len(df) < MIN_WARMUP:
-        print(f"Not enough candles yet ({len(df)} < {MIN_WARMUP}).")
+    if len(df) < MIN_CANDLES:
+        print(f"Not enough candles yet ({len(df)} < {MIN_CANDLES}).")
         return
 
-    print(f"Calculating Bollinger Bands ({BB_PERIOD})...")
-    df = calculate_bb(df)
+    print("Calculating indicators...")
+    df = calculate_indicators(df)
 
-    curr = df.iloc[-1]
+    signals = run_logic(df)
 
-    close_val = curr["close"]
-    high_val = curr["high"]
-    low_val = curr["low"]
-    basis_val = curr["basis"]
-    upper_val = curr["upper"]
-    lower_val = curr["lower"]
-    time_str = curr["datetime"].strftime("%Y-%m-%d %H:%M:%S")
+    state = load_state()
+    last_alert = None
+    if state.get("last_alert_time"):
+        last_alert = pd.Timestamp(state["last_alert_time"])
 
-    if pd.isna(basis_val) or pd.isna(upper_val) or pd.isna(lower_val):
-        print("Indicators not ready yet (NaN). Skipping.")
-        return
+    last_idx = len(df) - 1
+    last_row = df.iloc[-1]
+    last_close = float(last_row["close"])
 
-    print(f"Checking candle: {time_str} (live)")
-    print(f"High: {high_val} | Low: {low_val} | Basis: {basis_val}")
+    print(f"Last closed candle: {last_row['datetime']} | close: {last_close:.2f}")
+    print(
+        f"MACD-V: {last_row['macdv']:.3f} | Signal: {last_row['msig']:.3f} | "
+        f"WPR: {last_row['wpr']:.2f} | Mid: {last_row['wbas']:.2f}"
+    )
 
-    # برخورد = بازه high/low کندل، باند وسط رو پوشش داده باشه
-    touched_middle = low_val <= basis_val <= high_val
+    pending = []
+    for s in signals:
+        fresh = (last_idx - s["i"]) < MAX_AGE_BARS
+        is_new = last_alert is None or s["time"] > last_alert
+        if fresh and is_new:
+            pending.append(s)
 
-    if touched_middle:
+    print(f"Signals found: {len(signals)} | pending: {len(pending)}")
 
-        message = build_message(
-            close_val, basis_val, upper_val, lower_val,
-            high_val, low_val, time_str
-        )
+    for s in pending:
+
+        message = build_message(s, last_idx, last_close)
 
         print(f"Sending Alert:\n{message}")
         send_telegram(message)
 
-    else:
-        print("No touch on middle band this run.")
+        # save right after each successful send to avoid duplicates
+        state["last_alert_time"] = s["time"].isoformat()
+        save_state(state)
+
+    save_state(state)
 
     print("Execution completed.")
 
@@ -186,7 +436,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"FATAL ERROR: {e}")
-        send_error_alert(str(e))
+        print(f"FATAL ERROR: {safe_text(e)}")
+        send_error_alert(safe_text(e))
         raise
         
