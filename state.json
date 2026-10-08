@@ -1,13 +1,19 @@
 {
-  "last_signal_CAD/JPY_di100": "bearish",
-  "last_bar_CAD/JPY_di100": "2026-08-19 12:40:00",
   "alerted_combo_5min": "bullish_bullish",
-  "di14_dir_5min": "bullish",
+  "band_status": {
+    "bb100_lower_status": "none",
+    "bb100_upper_status": "none",
+    "bb50_lower_status": "none",
+    "bb50_upper_status": "none"
+  },
+  "bearish_arm": "NONE",
+  "bullish_arm": "NONE",
+  "cond1_last_bar_a": "2026-08-21 03:22:00",
+  "cond1_last_bar_b": "2026-08-21 03:17:00",
   "cond2_last_bar": "2026-08-20 07:36:00",
   "cond2_state": "bullish",
-  "cond1_last_bar_a": "2026-08-21 03:22:00",
   "cond3_last_bar": "2026-08-21 03:31:00",
-  "cond1_last_bar_b": "2026-08-21 03:17:00",
+  "di14_dir_5min": "bullish",
   "last_alert_keys": [
     "BB50_2026-08-21 11:50:00_Upper Band",
     "BB50_2026-08-21 11:44:00_Upper Band",
@@ -105,14 +111,8 @@
     "BB50_2026-08-21 10:08:00_Upper Band",
     "BB50_2026-08-21 10:50:00_Upper Band"
   ],
-  "band_status": {
-    "bb50_upper_status": "none",
-    "bb50_lower_status": "none",
-    "bb100_upper_status": "none",
-    "bb100_lower_status": "none"
-  },
+  "last_bar_CAD/JPY_di100": "2026-08-19 12:40:00",
   "last_candle_time": "2026-09-02 22:05:00",
   "last_position": "INSIDE",
-  "bearish_arm": "NONE",
-  "bullish_arm": "NONE"
+  "last_signal_CAD/JPY_di100": "bearish"
 }
