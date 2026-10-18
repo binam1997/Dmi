@@ -11,7 +11,7 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 
 # =========================================================
-# SETTINGS
+# SETTINGS (same values as the TradingView strategy "WPR DT/DB")
 # =========================================================
 
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
@@ -21,7 +21,6 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 BAR_MINUTES = 5
-
 OUTPUT_SIZE = 1000
 WARMUP_BARS = 300
 MIN_CANDLES = WARMUP_BARS + 50
@@ -29,32 +28,67 @@ MIN_CANDLES = WARMUP_BARS + 50
 # signals older than this many closed candles are ignored (protects from late runs)
 MAX_AGE_BARS = 3
 
-STATE_FILE = "state.json"
+STATE_FILE = "wpr_state.json"
 ERROR_ALERT_MINUTES = 60
 
-# signal logic
-WINDOW = 10
-RE_ENTRY = True
+# --- general ---
+ENTRY_MODE = "all"                # "all" = on every DT/DB diamond, "main" = after neckline break
+LOC_MODE = "mean_reversion"       # "mean_reversion", "with_trend", "off"
+REV_OK = True                     # opposite signal may reverse an open trade
+BB_LEN = 100
+BB_TYPE = "SMA"                   # "SMA" or "EMA"
 
-# MACD-V (MACD Dive LTF)
-M_FAST = 30
-M_SLOW = 100
-M_SIG = 20
-M_ATR = 100
-
-# WPRBB (Loxx)
+# --- WPR ---
 W_LEN = 30
 W_SM = 20
-BB_LEN = 100
+MID_LEN = 100
 W_HL = True
 
-# stop / take profit
-STOP_MODE = "Swing"  # "Swing" or "ATR"
-SWING_LEN = 10
+# --- %B ---
+PB_LEN = 25
+PB_MULT = 2.0
+
+# --- 5m phase filter ---
+PHASE_MODE = "off"                # "off", "block", "require"
+WALK_N = 12
+WALK_LO = 0.5
+TURN_LVL = 0.5
+
+# --- 15m %B filter ---
+H15_MODE = "direction"            # "off", "direction", "side"
+H15_LVL = 0.5
+
+# --- pattern ---
+P_L = 3
+P_R = 3
+MIN_GAP = 4
+MAX_GAP = 40
+TOL = 8.0
+MIN_DEPTH = 10.0
+REQ_SIDE = True
+TRIG_WIN = 30
+
+# --- stop and target ---
+STOP_MODE = "atr"                 # "atr" = distance from entry, "swing" = swing extreme +- ATR buffer
+SWING_LEN = 30
 ATR_LEN = 14
-ATR_BUF = 0.3
-ATR_MULT = 2.0
+ATR_TYPE = "rma"                  # "rma" or "sma"
+ATR_BUF = 2.0
+ATR_MULT = 1.5
+MAX_RISK_PTS = 0.0                # 0 = off
+RISK_MODE = "skip"                # "skip" or "cap"
+TP_MODE = "rr"                    # "rr" or "bbmid"
 RR = 1.5
+MIN_TPR = 0.5
+
+# --- exit mode ---
+X_MODE = "fixed"                  # "fixed", "pctb", "pctb_tp"
+X_LVL = 0.5
+
+ENTRY_ALL = ENTRY_MODE == "all"
+MAIN_MODE = not ENTRY_ALL
+USE_BX = X_MODE != "fixed"
+TP_ON = X_MODE != "pctb"
 
 
 # =========================================================
@@ -105,7 +139,8 @@ def get_data():
         "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
-        "timezone": "Asia/Tehran"
+        "timezone": "UTC",
+        "order": "asc"
     }
 
     response = requests.get(url, params=params, timeout=20)
@@ -121,12 +156,12 @@ def get_data():
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(IRAN_TZ)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.dropna(subset=["open", "high", "low", "close"])
     df = df.sort_values("datetime").reset_index(drop=True)
 
     # keep only fully closed candles (datetime = candle open time)
-    now = pd.Timestamp.now(tz=IRAN_TZ)
+    now = pd.Timestamp.now(tz="UTC")
     closed = (df["datetime"] + pd.Timedelta(minutes=BAR_MINUTES)) <= now
     df = df[closed].reset_index(drop=True)
 
@@ -147,10 +182,29 @@ def rma(series, length):
     return series.ewm(alpha=1 / length, adjust=False).mean()
 
 
-def calc_atr(df, length):
+def add_indicators(df):
 
-    prev_close = df["close"].shift(1)
+    close = df["close"]
 
+    # WPR
+    hi = df["high"] if W_HL else close
+    lo = df["low"] if W_HL else close
+    highest = hi.rolling(W_LEN).max()
+    lowest = lo.rolling(W_LEN).min()
+    raw = (close - lowest) / (highest - lowest) * 200 - 100
+    df["wpr"] = ema(raw, W_SM)
+    df["wmid"] = ema(df["wpr"], MID_LEN)
+
+    # price Bollinger midline
+    df["bbmid"] = ema(close, BB_LEN) if BB_TYPE == "EMA" else close.rolling(BB_LEN).mean()
+
+    # %B on the chart timeframe
+    pb_mid = close.rolling(PB_LEN).mean()
+    pb_dev = PB_MULT * close.rolling(PB_LEN).std(ddof=0)
+    df["pb"] = (close - (pb_mid - pb_dev)) / (2 * pb_dev)
+
+    # ATR
+    prev_close = close.shift(1)
     tr = pd.concat(
         [
             df["high"] - df["low"],
@@ -159,148 +213,288 @@ def calc_atr(df, length):
         ],
         axis=1,
     ).max(axis=1)
+    df["atr"] = tr.rolling(ATR_LEN).mean() if ATR_TYPE == "sma" else rma(tr, ATR_LEN)
 
-    return rma(tr, length)
-
-
-def calculate_indicators(df):
-
-    # MACD-V
-    df["macdv"] = (ema(df["close"], M_FAST) - ema(df["close"], M_SLOW)) / calc_atr(df, M_ATR)
-    df["msig"] = ema(df["macdv"], M_SIG)
-
-    # WPRBB
-    hi = df["high"] if W_HL else df["close"]
-    lo = df["low"] if W_HL else df["close"]
-    highest = hi.rolling(W_LEN).max()
-    lowest = lo.rolling(W_LEN).min()
-    raw = (df["close"] - lowest) / (highest - lowest) * 200 - 100
-    df["wpr"] = ema(raw, W_SM)
-    df["wbas"] = ema(df["wpr"], BB_LEN)
-
-    # stop helpers
-    df["atr_s"] = calc_atr(df, ATR_LEN)
     df["swing_hi"] = df["high"].rolling(SWING_LEN).max()
     df["swing_lo"] = df["low"].rolling(SWING_LEN).min()
 
     return df
 
 
+def add_h15(df):
+
+    # %B of the last two CLOSED 15m bars before the 15m bar that contains each 5m bar
+    s = df.set_index("datetime")["close"]
+    c15 = s.resample("15min", label="left", closed="left").last().dropna()
+    mid = c15.rolling(PB_LEN).mean()
+    dev = PB_MULT * c15.rolling(PB_LEN).std(ddof=0)
+    pb15 = (c15 - (mid - dev)) / (2 * dev)
+
+    last1 = pb15.shift(1)
+    last2 = pb15.shift(2)
+
+    start = df["datetime"].dt.floor("15min")
+    df["hb_now"] = last1.reindex(start).to_numpy()
+    df["hb_prev"] = last2.reindex(start).to_numpy()
+
+    return df
+
+
 # =========================================================
-# SIGNAL LOGIC
+# SIGNAL LOGIC (port of the Pine strategy)
 # =========================================================
 
 def run_logic(df):
 
+    n = len(df)
     t = df["datetime"].tolist()
     c = df["close"].to_numpy()
     h = df["high"].to_numpy()
     l = df["low"].to_numpy()
-    mv = df["macdv"].to_numpy()
-    ms = df["msig"].to_numpy()
-    wp = df["wpr"].to_numpy()
-    wb = df["wbas"].to_numpy()
-    a = df["atr_s"].to_numpy()
+    w = df["wpr"].to_numpy()
+    wm = df["wmid"].to_numpy()
+    bb = df["bbmid"].to_numpy()
+    pb = df["pb"].to_numpy()
+    at = df["atr"].to_numpy()
     sh = df["swing_hi"].to_numpy()
     sl = df["swing_lo"].to_numpy()
+    hbn = df["hb_now"].to_numpy()
+    hbp = df["hb_prev"].to_numpy()
 
     signals = []
-    last_dir = 0
-    status = "-"
+
+    pos = 0
     stop_lv = None
     tp_lv = None
-    lm_up = None
-    lm_dn = None
-    lw_up = None
-    lw_dn = None
+    x_arm = False
 
-    for i in range(1, len(df)):
+    # double top state
+    ph_l = None
+    ph_lix = None
+    ph_lmid = None
+    neck_t = None
+    arm_top = False
+    arm_t_neck = None
+    arm_t_lvl = None
+    arm_t_bar = None
+
+    # double bottom state
+    pl_l = None
+    pl_lix = None
+    pl_lmid = None
+    neck_b = None
+    arm_bot = False
+    arm_b_neck = None
+    arm_b_lvl = None
+    arm_b_bar = None
+
+    for i in range(1, n):
 
         if i < WARMUP_BARS:
             continue
 
-        m_up = bool(mv[i] > ms[i] and mv[i - 1] <= ms[i - 1])
-        m_dn = bool(mv[i] < ms[i] and mv[i - 1] >= ms[i - 1])
-        w_up = bool(wp[i] > wb[i] and wp[i - 1] <= wb[i - 1])
-        w_dn = bool(wp[i] < wb[i] and wp[i - 1] >= wb[i - 1])
-
-        if m_up:
-            lm_up = i
-        if m_dn:
-            lm_dn = i
-        if w_up:
-            lw_up = i
-        if w_dn:
-            lw_dn = i
-
-        # stop / take profit hit (levels from the previous bar)
-        hit_stop = False
-        hit_tp = False
-
-        if stop_lv is not None:
-            if last_dir == 1:
-                hit_stop = bool(l[i] <= stop_lv)
-                hit_tp = bool(h[i] >= tp_lv)
-            elif last_dir == -1:
-                hit_stop = bool(h[i] >= stop_lv)
-                hit_tp = bool(l[i] <= tp_lv)
-
-        def within(last):
-            return last is not None and (i - last) <= WINDOW
-
-        buy_ev = (m_up and wp[i] > wb[i] and within(lw_up)) or (w_up and mv[i] > ms[i] and within(lm_up))
-        sell_ev = (m_dn and wp[i] < wb[i] and within(lw_dn)) or (w_dn and mv[i] < ms[i] and within(lm_dn))
-
-        free = RE_ENTRY and status != "OPEN"
-        buy_sig = buy_ev and (last_dir != 1 or free)
-        sell_sig = sell_ev and (last_dir != -1 or free)
-
-        if buy_sig and sell_sig:
-            continue
-
-        if buy_sig or sell_sig:
-
-            direction = 1 if buy_sig else -1
-
-            if STOP_MODE == "Swing":
-                if direction == 1:
-                    stop = sl[i] - ATR_BUF * a[i]
-                else:
-                    stop = sh[i] + ATR_BUF * a[i]
+        # ---------- stop / take profit hit during this bar ----------
+        if pos != 0 and stop_lv is not None:
+            if pos == 1:
+                hit_stop = l[i] <= stop_lv
+                hit_tp = TP_ON and tp_lv is not None and h[i] >= tp_lv
             else:
-                if direction == 1:
-                    stop = c[i] - ATR_MULT * a[i]
-                else:
-                    stop = c[i] + ATR_MULT * a[i]
+                hit_stop = h[i] >= stop_lv
+                hit_tp = TP_ON and tp_lv is not None and l[i] <= tp_lv
+            if hit_stop or hit_tp:
+                pos = 0
+                stop_lv = None
+                tp_lv = None
 
-            if direction == 1:
-                tp = c[i] + RR * (c[i] - stop)
-            else:
-                tp = c[i] - RR * (stop - c[i])
+        # ---------- pivots on WPR ----------
+        cidx = i - P_R
+        new_ph = False
+        new_pl = False
+        ph = None
+        pl = None
+        if cidx - P_L >= 0:
+            center = w[cidx]
+            seg_l = w[cidx - P_L:cidx]
+            seg_r = w[cidx + 1:i + 1]
+            if not np.isnan(center) and not np.isnan(seg_l).any() and not np.isnan(seg_r).any():
+                if center > seg_l.max() and center > seg_r.max():
+                    new_ph = True
+                    ph = float(center)
+                elif center < seg_l.min() and center < seg_r.min():
+                    new_pl = True
+                    pl = float(center)
+        m_at_p = wm[cidx] if cidx >= 0 else np.nan
 
-            stop_lv = float(stop)
-            tp_lv = float(tp)
-            last_dir = direction
-            status = "OPEN"
+        # ---------- double top ----------
+        valid_t = False
+        if new_ph and ph_l is not None and neck_t is not None:
+            gap = cidx - ph_lix
+            if MIN_GAP <= gap <= MAX_GAP and abs(ph - ph_l) <= TOL and (min(ph, ph_l) - neck_t) >= MIN_DEPTH:
+                if (not REQ_SIDE) or (ph > m_at_p and ph_l > ph_lmid):
+                    valid_t = True
 
+        if valid_t:
+            arm_top = MAIN_MODE
+            arm_t_neck = neck_t
+            arm_t_lvl = max(ph, ph_l)
+            arm_t_bar = i
+        elif new_ph:
+            arm_top = False
+
+        if new_ph:
+            neck_t = None
+        elif new_pl:
+            neck_t = pl if neck_t is None else min(neck_t, pl)
+
+        if new_ph:
+            ph_l = ph
+            ph_lix = cidx
+            ph_lmid = m_at_p
+
+        exp_t = arm_top and (i - arm_t_bar) > TRIG_WIN
+        inv_t = arm_top and w[i] > arm_t_lvl + TOL
+        brk_t = arm_top and w[i] < arm_t_neck
+        raw_sell = valid_t if ENTRY_ALL else brk_t
+        if brk_t or exp_t or inv_t:
+            arm_top = False
+
+        # ---------- double bottom ----------
+        valid_b = False
+        if new_pl and pl_l is not None and neck_b is not None:
+            gap = cidx - pl_lix
+            if MIN_GAP <= gap <= MAX_GAP and abs(pl - pl_l) <= TOL and (neck_b - max(pl, pl_l)) >= MIN_DEPTH:
+                if (not REQ_SIDE) or (pl < m_at_p and pl_l < pl_lmid):
+                    valid_b = True
+
+        if valid_b:
+            arm_bot = MAIN_MODE
+            arm_b_neck = neck_b
+            arm_b_lvl = min(pl, pl_l)
+            arm_b_bar = i
+        elif new_pl:
+            arm_bot = False
+
+        if new_pl:
+            neck_b = None
+        elif new_ph:
+            neck_b = ph if neck_b is None else max(neck_b, ph)
+
+        if new_pl:
+            pl_l = pl
+            pl_lix = cidx
+            pl_lmid = m_at_p
+
+        exp_b = arm_bot and (i - arm_b_bar) > TRIG_WIN
+        inv_b = arm_bot and w[i] < arm_b_lvl - TOL
+        brk_b = arm_bot and w[i] > arm_b_neck
+        raw_buy = valid_b if ENTRY_ALL else brk_b
+        if brk_b or exp_b or inv_b:
+            arm_bot = False
+
+        # ---------- location filter ----------
+        if LOC_MODE == "off":
+            loc_ok_s = True
+            loc_ok_b = True
+        elif LOC_MODE == "mean_reversion":
+            loc_ok_s = bool(c[i] > bb[i])
+            loc_ok_b = bool(c[i] < bb[i])
+        else:
+            loc_ok_s = bool(c[i] < bb[i])
+            loc_ok_b = bool(c[i] > bb[i])
+
+        sell_sig = bool(raw_sell and loc_ok_s)
+        buy_sig = bool(raw_buy and loc_ok_b)
+
+        # ---------- %B 5m phase filter ----------
+        win = pb[max(0, i - WALK_N + 1):i + 1]
+        dn_walk = bool(win.max() < TURN_LVL and pb[i] <= WALK_LO)
+        up_walk = bool(win.min() > TURN_LVL and pb[i] >= 1 - WALK_LO)
+        if PHASE_MODE == "block":
+            blk_buy_p = dn_walk
+            blk_sell_p = up_walk
+        elif PHASE_MODE == "require":
+            blk_buy_p = not (pb[i] > TURN_LVL)
+            blk_sell_p = not (pb[i] < TURN_LVL)
+        else:
+            blk_buy_p = False
+            blk_sell_p = False
+
+        # ---------- %B 15m filter ----------
+        hb_rise = bool(hbn[i] > hbp[i])
+        hb_fall = bool(hbn[i] < hbp[i])
+        if H15_MODE == "off":
+            h15_buy_ok = True
+            h15_sell_ok = True
+        else:
+            h15_buy_ok = hb_rise and (H15_MODE == "direction" or hbn[i] > H15_LVL)
+            h15_sell_ok = hb_fall and (H15_MODE == "direction" or hbn[i] < H15_LVL)
+
+        buy_pass = (not blk_buy_p) and h15_buy_ok
+        sell_pass = (not blk_sell_p) and h15_sell_ok
+
+        # ---------- stop and target ----------
+        atr_i = at[i]
+        if STOP_MODE == "swing":
+            sell_stop_raw = sh[i] + ATR_BUF * atr_i
+            buy_stop_raw = sl[i] - ATR_BUF * atr_i
+        else:
+            sell_stop_raw = c[i] + ATR_MULT * atr_i
+            buy_stop_raw = c[i] - ATR_MULT * atr_i
+
+        cap = RISK_MODE == "cap"
+        too_big_s = MAX_RISK_PTS > 0 and (sell_stop_raw - c[i]) > MAX_RISK_PTS
+        too_big_b = MAX_RISK_PTS > 0 and (c[i] - buy_stop_raw) > MAX_RISK_PTS
+        sell_stop = c[i] + MAX_RISK_PTS if (too_big_s and cap) else sell_stop_raw
+        buy_stop = c[i] - MAX_RISK_PTS if (too_big_b and cap) else buy_stop_raw
+        sell_risk = sell_stop - c[i]
+        buy_risk = c[i] - buy_stop
+
+        mid_s = TP_MODE == "bbmid" and (c[i] - bb[i]) >= MIN_TPR * sell_risk
+        mid_b = TP_MODE == "bbmid" and (bb[i] - c[i]) >= MIN_TPR * buy_risk
+        sell_tp = bb[i] if mid_s else c[i] - RR * sell_risk
+        buy_tp = bb[i] if mid_b else c[i] + RR * buy_risk
+        tp_ok_s = not (too_big_s and not cap)
+        tp_ok_b = not (too_big_b and not cap)
+
+        # ---------- entries ----------
+        sell_go = sell_sig and tp_ok_s and sell_pass and (not buy_sig) and pos >= 0 and (pos == 0 or REV_OK)
+        buy_go = buy_sig and tp_ok_b and buy_pass and (not sell_sig) and pos <= 0 and (pos == 0 or REV_OK)
+
+        # ---------- %B exit (decided with the position before this bar's entry) ----------
+        bx_long = USE_BX and pos > 0 and x_arm and pb[i] <= X_LVL
+        bx_short = USE_BX and pos < 0 and x_arm and pb[i] >= X_LVL
+        if pos == 0:
+            x_arm = False
+        else:
+            x_arm = x_arm or ((pb[i] > X_LVL) if pos > 0 else (pb[i] < X_LVL))
+
+        pos_before = pos
+
+        if sell_go or buy_go:
+            direction = -1 if sell_go else 1
+            stop = float(sell_stop if sell_go else buy_stop)
+            tp = float(sell_tp if sell_go else buy_tp)
             signals.append({
                 "i": i,
                 "time": t[i],
                 "dir": direction,
                 "entry": float(c[i]),
-                "stop": stop_lv,
-                "tp": tp_lv,
-                "macdv": float(mv[i]),
-                "msig": float(ms[i]),
-                "wpr": float(wp[i]),
-                "wbas": float(wb[i]),
+                "stop": stop,
+                "tp": tp if TP_ON else None,
+                "wpr": float(w[i]),
+                "pb5": float(pb[i]),
+                "pb15": float(hbn[i]) if not np.isnan(hbn[i]) else None,
+                "pb15_up": hb_rise,
+                "reversal": pos_before != 0,
             })
-
-        elif hit_stop or hit_tp:
-
+            pos = direction
+            stop_lv = stop
+            tp_lv = tp if TP_ON else None
+            x_arm = False
+        elif (bx_long and pos == 1) or (bx_short and pos == -1):
+            pos = 0
             stop_lv = None
             tp_lv = None
-            status = "STOPPED" if hit_stop else "TP HIT"
 
     return signals
 
@@ -329,7 +523,7 @@ def send_error_alert(error_text):
             if elapsed < ERROR_ALERT_MINUTES * 60:
                 return
 
-        send_telegram(f"⚠️ ربات سیگنال MACD-V + WPRBB خطا داد:\n\n{error_text}")
+        send_telegram(f"⚠️ ربات سیگنال WPR خطا داد:\n\n{error_text}")
 
         state["last_error_time"] = now.isoformat()
         save_state(state)
@@ -340,29 +534,45 @@ def send_error_alert(error_text):
 def build_message(s, last_idx, last_close):
 
     is_buy = s["dir"] == 1
-    side = "BUY" if is_buy else "SELL"
+    side = "خرید (کف دوقلو)" if is_buy else "فروش (سقف دوقلو)"
     icon = "🟢" if is_buy else "🔴"
+    mode = "روی لوزی" if ENTRY_ALL else "شکست خط گردن"
 
     risk = abs(s["entry"] - s["stop"])
-    close_time = (s["time"] + pd.Timedelta(minutes=BAR_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+    close_time = (s["time"] + pd.Timedelta(minutes=BAR_MINUTES)).tz_convert(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    if s["tp"] is None:
+        tp_line = "🎯 حد سود: ندارد (خروج با %B)"
+    else:
+        reward = abs(s["tp"] - s["entry"])
+        rr_val = reward / risk if risk > 0 else 0
+        tp_line = f"🎯 حد سود: {s['tp']:.2f} (ریوارد {rr_val:.1f} برابر)"
+
+    pb15_txt = "-"
+    if s["pb15"] is not None:
+        pb15_txt = f"{s['pb15']:.2f} " + ("صعودی" if s["pb15_up"] else "نزولی")
+
+    extra = ""
+    if s["reversal"]:
+        extra += "\n🔁 این سیگنال معامله باز قبلی را معکوس می کند"
 
     age = last_idx - s["i"]
-    late_line = ""
     if age >= 1:
-        late_line = f"\n⏱ این سیگنال {age} کندل پیش صادر شده | قیمت فعلی: {last_close:.2f}"
+        extra += f"\n⏱ این سیگنال {age} کندل پیش صادر شده | قیمت فعلی: {last_close:.2f}"
 
     return f"""
 {icon} سیگنال {side} ({SYMBOL} - ۵ دقیقه)
 
 💰 ورود (کلوز کندل): {s['entry']:.2f}
 🛑 استاپ: {s['stop']:.2f} (ریسک {risk:.2f})
-🎯 حد سود: {s['tp']:.2f} ({RR}R)
+{tp_line}
 
-📊 MACD-V: {s['macdv']:.3f} | سیگنال: {s['msig']:.3f}
-📉 WPR: {s['wpr']:.1f} | میدلاین: {s['wbas']:.1f}
+📊 WPR: {s['wpr']:.1f} | %B پنج دقیقه: {s['pb5']:.2f}
+📈 %B پانزده دقیقه: {pb15_txt}
+🧩 حالت ورود: {mode}
 
 ━━━━━━━━━━━━━━
-⏱ زمان بسته شدن کندل: {close_time}{late_line}
+⏱ زمان بسته شدن کندل: {close_time}{extra}
 """.strip()
 
 
@@ -373,7 +583,7 @@ def build_message(s, last_idx, last_close):
 def main():
 
     if os.environ.get("TEST_MESSAGE") == "1":
-        send_telegram("✅ ربات سیگنال MACD-V + WPRBB فعال است")
+        send_telegram("✅ ربات سیگنال WPR فعال است")
         print("Test message sent.")
         return
 
@@ -385,7 +595,8 @@ def main():
         return
 
     print("Calculating indicators...")
-    df = calculate_indicators(df)
+    df = add_indicators(df)
+    df = add_h15(df)
 
     signals = run_logic(df)
 
@@ -400,8 +611,8 @@ def main():
 
     print(f"Last closed candle: {last_row['datetime']} | close: {last_close:.2f}")
     print(
-        f"MACD-V: {last_row['macdv']:.3f} | Signal: {last_row['msig']:.3f} | "
-        f"WPR: {last_row['wpr']:.2f} | Mid: {last_row['wbas']:.2f}"
+        f"WPR: {last_row['wpr']:.2f} | WPR mid: {last_row['wmid']:.2f} | "
+        f"%B 5m: {last_row['pb']:.2f} | %B 15m: {last_row['hb_now']:.2f} (prev {last_row['hb_prev']:.2f})"
     )
 
     pending = []
@@ -439,4 +650,4 @@ if __name__ == "__main__":
         print(f"FATAL ERROR: {safe_text(e)}")
         send_error_alert(safe_text(e))
         raise
-        
+            
