@@ -63,13 +63,15 @@ P_L = 3
 P_R = 3
 MIN_GAP = 4
 MAX_GAP = 40
+ALLOW_FS = True                   # Allow Divergence / Failure Swing
 TOL = 8.0
 MIN_DEPTH = 10.0
 REQ_SIDE = True
 TRIG_WIN = 30
 
 # --- stop and target ---
-STOP_MODE = "atr"                 # "atr" = distance from entry, "swing" = swing extreme +- ATR buffer
+STOP_MODE = "swing"               # "atr" = distance from entry, "swing" = swing extreme +- ATR buffer
+
 SWING_LEN = 30
 ATR_LEN = 14
 ATR_TYPE = "rma"                  # "rma" or "sma"
@@ -78,7 +80,7 @@ ATR_MULT = 1.5
 MAX_RISK_PTS = 0.0                # 0 = off
 RISK_MODE = "skip"                # "skip" or "cap"
 TP_MODE = "rr"                    # "rr" or "bbmid"
-RR = 1.5
+RR = 1.0                          # Changed to 1.0
 MIN_TPR = 0.5
 
 # --- exit mode ---
@@ -173,14 +175,10 @@ def get_data():
 # =========================================================
 
 def ema(series, length):
-
     return series.ewm(span=length, adjust=False).mean()
 
-
 def rma(series, length):
-
     return series.ewm(alpha=1 / length, adjust=False).mean()
-
 
 def add_indicators(df):
 
@@ -219,7 +217,6 @@ def add_indicators(df):
     df["swing_lo"] = df["low"].rolling(SWING_LEN).min()
 
     return df
-
 
 def add_h15(df):
 
@@ -329,7 +326,9 @@ def run_logic(df):
         valid_t = False
         if new_ph and ph_l is not None and neck_t is not None:
             gap = cidx - ph_lix
-            if MIN_GAP <= gap <= MAX_GAP and abs(ph - ph_l) <= TOL and (min(ph, ph_l) - neck_t) >= MIN_DEPTH:
+            wpr_top_cond = (ph <= ph_l + TOL) if ALLOW_FS else (abs(ph - ph_l) <= TOL)
+            
+            if MIN_GAP <= gap <= MAX_GAP and wpr_top_cond and (min(ph, ph_l) - neck_t) >= MIN_DEPTH:
                 if (not REQ_SIDE) or (ph > m_at_p and ph_l > ph_lmid):
                     valid_t = True
 
@@ -362,7 +361,9 @@ def run_logic(df):
         valid_b = False
         if new_pl and pl_l is not None and neck_b is not None:
             gap = cidx - pl_lix
-            if MIN_GAP <= gap <= MAX_GAP and abs(pl - pl_l) <= TOL and (neck_b - max(pl, pl_l)) >= MIN_DEPTH:
+            wpr_bot_cond = (pl >= pl_l - TOL) if ALLOW_FS else (abs(pl - pl_l) <= TOL)
+            
+            if MIN_GAP <= gap <= MAX_GAP and wpr_bot_cond and (neck_b - max(pl, pl_l)) >= MIN_DEPTH:
                 if (not REQ_SIDE) or (pl < m_at_p and pl_l < pl_lmid):
                     valid_b = True
 
@@ -401,9 +402,6 @@ def run_logic(df):
         else:
             loc_ok_s = bool(c[i] < bb[i])
             loc_ok_b = bool(c[i] > bb[i])
-
-        sell_sig = bool(raw_sell and loc_ok_s)
-        buy_sig = bool(raw_buy and loc_ok_b)
 
         # ---------- %B 5m phase filter ----------
         win = pb[max(0, i - WALK_N + 1):i + 1]
@@ -456,11 +454,38 @@ def run_logic(df):
         tp_ok_s = not (too_big_s and not cap)
         tp_ok_b = not (too_big_b and not cap)
 
-        # ---------- entries ----------
-        sell_go = sell_sig and tp_ok_s and sell_pass and (not buy_sig) and pos >= 0 and (pos == 0 or REV_OK)
-        buy_go = buy_sig and tp_ok_b and buy_pass and (not sell_sig) and pos <= 0 and (pos == 0 or REV_OK)
+        # ---------- SIGNAL EVALUATION AND ALERTS ----------
+        direction = 0
+        is_action = False
+        block_reason = None
 
-        # ---------- %B exit (decided with the position before this bar's entry) ----------
+        if raw_sell:
+            direction = -1
+            if not loc_ok_s:
+                block_reason = "محل قیمت (زیر میانگین بولینجر)"
+            elif not sell_pass:
+                block_reason = f"فاز %B 5m یا 15m"
+            elif not tp_ok_s:
+                block_reason = "ریسک فراتر از حد مجاز"
+            elif pos < 0 or (pos > 0 and not REV_OK):
+                block_reason = "یک موقعیت فروش از قبل باز است"
+            else:
+                is_action = True
+
+        elif raw_buy:
+            direction = 1
+            if not loc_ok_b:
+                block_reason = "محل قیمت (بالای میانگین بولینجر)"
+            elif not buy_pass:
+                block_reason = f"فاز %B 5m یا 15m"
+            elif not tp_ok_b:
+                block_reason = "ریسک فراتر از حد مجاز"
+            elif pos > 0 or (pos < 0 and not REV_OK):
+                block_reason = "یک موقعیت خرید از قبل باز است"
+            else:
+                is_action = True
+
+        # ---------- %B exit ----------
         bx_long = USE_BX and pos > 0 and x_arm and pb[i] <= X_LVL
         bx_short = USE_BX and pos < 0 and x_arm and pb[i] >= X_LVL
         if pos == 0:
@@ -470,28 +495,48 @@ def run_logic(df):
 
         pos_before = pos
 
-        if sell_go or buy_go:
-            direction = -1 if sell_go else 1
-            stop = float(sell_stop if sell_go else buy_stop)
-            tp = float(sell_tp if sell_go else buy_tp)
+        # Add Signal / Blocked Event to List
+        if direction != 0:
             signals.append({
                 "i": i,
                 "time": t[i],
                 "dir": direction,
+                "is_action": is_action,
+                "block_reason": block_reason,
                 "entry": float(c[i]),
-                "stop": stop,
-                "tp": tp if TP_ON else None,
+                "stop": float(sell_stop if direction == -1 else buy_stop) if is_action else None,
+                "tp": float(sell_tp if direction == -1 else buy_tp) if TP_ON and is_action else None,
                 "wpr": float(w[i]),
                 "pb5": float(pb[i]),
                 "pb15": float(hbn[i]) if not np.isnan(hbn[i]) else None,
                 "pb15_up": hb_rise,
-                "reversal": pos_before != 0,
+                "reversal": (pos_before != 0) if is_action else False,
             })
-            pos = direction
-            stop_lv = stop
-            tp_lv = tp if TP_ON else None
-            x_arm = False
+            
+            # Execute trade if conditions met
+            if is_action:
+                pos = direction
+                stop_lv = float(sell_stop if direction == -1 else buy_stop)
+                tp_lv = float(sell_tp if direction == -1 else buy_tp) if TP_ON else None
+                x_arm = False
+
+        # Add Exit Event to List
         elif (bx_long and pos == 1) or (bx_short and pos == -1):
+            signals.append({
+                "i": i,
+                "time": t[i],
+                "dir": 0, # 0 means Exit
+                "is_action": True,
+                "block_reason": None,
+                "entry": float(c[i]),
+                "stop": None,
+                "tp": None,
+                "wpr": float(w[i]),
+                "pb5": float(pb[i]),
+                "pb15": None,
+                "pb15_up": None,
+                "reversal": False,
+            })
             pos = 0
             stop_lv = None
             tp_lv = None
@@ -511,8 +556,6 @@ def send_telegram(message):
 
 
 def send_error_alert(error_text):
-
-    # at most one error alert per ERROR_ALERT_MINUTES (the bot may run every few minutes)
     try:
         state = load_state()
         now = pd.Timestamp.now(tz=IRAN_TZ)
@@ -533,13 +576,41 @@ def send_error_alert(error_text):
 
 def build_message(s, last_idx, last_close):
 
+    close_time = (s["time"] + pd.Timedelta(minutes=BAR_MINUTES)).tz_convert(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    age = last_idx - s["i"]
+    age_txt = f"\n⏱ این پیام {age} کندل پیش صادر شده | قیمت فعلی: {last_close:.2f}" if age >= 1 else ""
+
+    # پیام خروج
+    if s["dir"] == 0:
+        return f"""
+⚪️ خروج از معامله (رسیدن به سطح %B)
+
+💰 قیمت خروج: {s['entry']:.2f}
+━━━━━━━━━━━━━━
+⏱ زمان: {close_time}{age_txt}
+""".strip()
+
     is_buy = s["dir"] == 1
     side = "خرید (کف دوقلو)" if is_buy else "فروش (سقف دوقلو)"
-    icon = "🟢" if is_buy else "🔴"
     mode = "روی لوزی" if ENTRY_ALL else "شکست خط گردن"
 
+    # پیام مسدود شدن الگو
+    if not s["is_action"]:
+        icon = "⚠️"
+        return f"""
+{icon} الگوی {side} مسدود شد!
+نماد: {SYMBOL} - ۵ دقیقه
+
+❌ علت مسدود شدن: {s['block_reason']}
+📊 مقدار %B پنج دقیقه: {s['pb5']:.2f}
+💰 قیمت فعلی: {s['entry']:.2f}
+━━━━━━━━━━━━━━
+⏱ زمان: {close_time}{age_txt}
+""".strip()
+
+    # پیام سیگنال قطعی
+    icon = "🟢" if is_buy else "🔴"
     risk = abs(s["entry"] - s["stop"])
-    close_time = (s["time"] + pd.Timedelta(minutes=BAR_MINUTES)).tz_convert(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     if s["tp"] is None:
         tp_line = "🎯 حد سود: ندارد (خروج با %B)"
@@ -556,12 +627,8 @@ def build_message(s, last_idx, last_close):
     if s["reversal"]:
         extra += "\n🔁 این سیگنال معامله باز قبلی را معکوس می کند"
 
-    age = last_idx - s["i"]
-    if age >= 1:
-        extra += f"\n⏱ این سیگنال {age} کندل پیش صادر شده | قیمت فعلی: {last_close:.2f}"
-
     return f"""
-{icon} سیگنال {side} ({SYMBOL} - ۵ دقیقه)
+{icon} سیگنال قطعی {side} ({SYMBOL} - ۵ دقیقه)
 
 💰 ورود (کلوز کندل): {s['entry']:.2f}
 🛑 استاپ: {s['stop']:.2f} (ریسک {risk:.2f})
@@ -572,7 +639,7 @@ def build_message(s, last_idx, last_close):
 🧩 حالت ورود: {mode}
 
 ━━━━━━━━━━━━━━
-⏱ زمان بسته شدن کندل: {close_time}{extra}
+⏱ زمان بسته شدن کندل: {close_time}{extra}{age_txt}
 """.strip()
 
 
@@ -603,7 +670,7 @@ def main():
     state = load_state()
     last_alert = None
     if state.get("last_alert_time"):
-        last_alert = pd.Timestamp(state["last_alert_time"])
+          last_alert = pd.Timestamp(state["last_alert_time"])
 
     last_idx = len(df) - 1
     last_row = df.iloc[-1]
@@ -650,4 +717,4 @@ if __name__ == "__main__":
         print(f"FATAL ERROR: {safe_text(e)}")
         send_error_alert(safe_text(e))
         raise
-            
+        
