@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOL = "XAU/USD"
 INTERVAL = "1h"       # تایم‌فریم ۱ ساعته
-OUTPUT_SIZE = 50      # دریافت ۵۰ کندل آخر (برای بولینجر ۲۰ کافیست)
+OUTPUT_SIZE = 150     # دریافت ۱۵۰ کندل برای عبور از تعطیلات آخر هفته
 
 # تنظیمات بولینجر باند
 BB_LENGTH = 20
@@ -80,6 +80,9 @@ def get_data():
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.dropna(subset=["open", "high", "low", "close"])
     
+    # فیلتر حیاتی: حذف کندل‌های روز شنبه و یکشنبه برای همخوانی با تریدینگ‌ویو
+    df = df[df['datetime'].dt.dayofweek < 5]
+    
     # مرتب‌سازی از قدیمی به جدید
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
@@ -87,6 +90,7 @@ def get_data():
 def add_bollinger_bands(df):
     # میانگین متحرک ساده (SMA)
     df['sma'] = df['close'].rolling(window=BB_LENGTH).mean()
+    
     # انحراف معیار
     df['std'] = df['close'].rolling(window=BB_LENGTH).std(ddof=0)
     
@@ -119,7 +123,7 @@ def main():
     # گرفتن آخرین کندل تشکیل‌شده (یا در حال تشکیل)
     last_candle = df.iloc[-1]
     
-    # تبدیل زمان به فرمت خوانا در ساعت ایران (فقط نمایش ساعت)
+    # تبدیل زمان به فرمت خوانا در ساعت ایران
     candle_time_str = last_candle['datetime'].tz_convert(IRAN_TZ).strftime("%Y-%m-%d %H:00")
     
     high = last_candle['high']
@@ -141,7 +145,7 @@ def main():
 
     alert_message = ""
 
-    # بررسی شرایط برخورد (آیا بیشترین قیمت به سقف خورده؟ یا کمترین قیمت به کف؟)
+    # بررسی شرایط برخورد
     if high >= upper:
         alert_message = (
             f"🔴 برخورد به سقف بولینجر باند!\n"
@@ -177,3 +181,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"Error: {e}")
+        
