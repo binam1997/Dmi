@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOL = "XAU/USD"
-INTERVAL = "1h"       # تایم‌فریم ۱ ساعته
+INTERVAL = "30min"
 OUTPUT_SIZE = 150     # دریافت ۱۵۰ کندل برای عبور از تعطیلات آخر هفته
 
 # تنظیمات بولینجر باند
